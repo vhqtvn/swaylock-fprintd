@@ -117,9 +117,9 @@ static void verify_result(GObject *object, const char *result, gboolean done, vo
 	}
 
 	if(state->match) {
-		display_message(state, "Fingerprint OK");
+		display_message(state, "FP OK");
 	} else {
-		display_message(state, "Retry");
+		display_message(state, "FP not match");
 	}
 
 	state->completed = TRUE;
