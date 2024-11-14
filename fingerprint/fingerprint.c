@@ -402,21 +402,25 @@ static void verify_result(GObject *object, const char *result, gboolean done, vo
 	bool should_restart = false;
 	if (g_str_equal(result, "verify-retry-scan"))
 	{
+		state->continous_unknown_error_count = 0;
 		display_message(state, "Retry");
 		return;
 	}
 	else if (g_str_equal(result, "verify-swipe-too-short"))
 	{
+		state->continous_unknown_error_count = 0;
 		display_message(state, "Retry, too short");
 		return;
 	}
 	else if (g_str_equal(result, "verify-finger-not-centered"))
 	{
+		state->continous_unknown_error_count = 0;
 		display_message(state, "Retry, not centered");
 		return;
 	}
 	else if (g_str_equal(result, "verify-remove-and-retry"))
 	{
+		state->continous_unknown_error_count = 0;
 		display_message(state, "Remove and retry");
 		return;
 	}
@@ -434,10 +438,12 @@ static void verify_result(GObject *object, const char *result, gboolean done, vo
 	}
 	else if (g_str_equal(result, "verify-match"))
 	{
+		state->continous_unknown_error_count = 0;
 	}
 	else if (g_str_equal(result, "verify-no-match"))
 	{
 		// should_restart = true;
+		state->continous_unknown_error_count = 0;
 		state->fail_count++;
 	}
 	else
@@ -606,6 +612,7 @@ static void handle_sleep_signal(GDBusProxy *proxy,
 	if (!going_to_sleep)
 	{ // System is resuming
 		swaylock_log(LOG_DEBUG, "System resumed, restarting fingerprint verification.");
+		system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint-service");
 		fingerprint_deinit(state);
 		fingerprint_init2(state);
 	}
