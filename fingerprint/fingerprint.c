@@ -29,6 +29,75 @@
 #include "fingerprint.h"
 #include "log.h"
 
+static void restart_fingerprint_usb_device_(bool full)
+{
+	if (full)
+	{
+		system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint full");
+	}
+	else
+	{
+		system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint");
+	}
+}
+
+static int restart_count = 0;
+static int last_usb_restart_time = 0;
+static int last_usb_full_restart_time = 0;
+static void restart_fingerprint_usb_device(bool full, bool wait)
+{
+	swaylock_log(LOG_DEBUG, "Restarting fingerprint device full=%d", full);
+	int current_time = time(NULL);
+	if (current_time - last_usb_full_restart_time < 3)
+	{
+		swaylock_log(LOG_DEBUG, "Skipping fingerprint device restart");
+		return;
+	}
+	if (current_time - last_usb_restart_time < 3 || restart_count >= 1)
+	{
+		if (!full)
+		{
+			full = true;
+		}
+	}
+	last_usb_restart_time = current_time;
+	if (full)
+	{
+		last_usb_full_restart_time = current_time;
+	}
+	restart_count++;
+	if (wait)
+	{
+		restart_fingerprint_usb_device_(full);
+	}
+	else
+	{
+		if (fork() == 0)
+		{
+			restart_fingerprint_usb_device_(full);
+			exit(0);
+		}
+		else
+		{
+			g_usleep(500000);
+		}
+	}
+}
+
+static bool run_main_context(int init_id, struct FingerprintState *state, int timeout)
+{
+	__time_t start_time = time(NULL);
+	while (time(NULL) - start_time < timeout)
+	{
+		g_main_context_iteration(NULL, TRUE);
+		if (init_id != state->init_id)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool should_disable_fingerprint(const struct FingerprintState *state)
 {
 	return state->fail_count >= 10 || state->restart_count >= 3;
@@ -54,7 +123,7 @@ static void create_manager(struct FingerprintState *state)
 	if (state->connection == NULL)
 	{
 		swaylock_log(LOG_ERROR, "Failed to connect to session bus: %s", error->message);
-		display_message(state, "Fingerprint error");
+		display_message(state, "FP ESB");
 		return;
 	}
 
@@ -67,57 +136,238 @@ static void create_manager(struct FingerprintState *state)
 	if (state->manager == NULL)
 	{
 		swaylock_log(LOG_ERROR, "Failed to get Fprintd manager: %s", error->message);
-		display_message(state, "Fingerprint error");
+		display_message(state, "FP EFM");
 		return;
 	}
 
 	swaylock_log(LOG_DEBUG, "FPrint manager created");
 }
 
-static void open_device(struct FingerprintState *state)
+static void destroy_manager(struct FingerprintState *state)
 {
-	state->device = NULL;
-	g_autoptr(FprintDBusDevice) dev = NULL;
-	g_autoptr(GError) error = NULL;
-	g_autofree char *path = NULL;
-	if (!fprint_dbus_manager_call_get_default_device_sync(state->manager, &path, NULL, &error))
+	g_clear_object(&state->manager);
+	g_clear_object(&state->connection);
+}
+
+struct FingerprintStateWithInitId
+{
+	struct FingerprintState *state;
+	int init_id;
+	char *path;
+	FprintDBusDevice *device;
+};
+
+static gboolean restart_verify_step_1(gpointer user_data);
+static void open_device_async_device_claim_cb(GObject *source_object,
+											  GAsyncResult *res,
+											  gpointer data)
+{
+	struct FingerprintStateWithInitId *state_wrapper = data;
+	if (state_wrapper->init_id != state_wrapper->state->init_id)
 	{
-		swaylock_log(LOG_ERROR, "Impossible to verify: %s", error->message);
-		display_message(state, "Fingerprint error");
+		g_object_unref(state_wrapper->device);
+		g_free(state_wrapper->path);
+		g_free(state_wrapper);
+		return;
+	}
+	GError *error = NULL;
+	if (!fprint_dbus_device_call_claim_finish(state_wrapper->device, res, &error))
+	{
+		swaylock_log(LOG_ERROR, "failed to claim the device: %s(%d)", error->message, error->code);
+		display_message(state_wrapper->state, "FP EDC");
+		if (++state_wrapper->state->claim_device_fail_count < 3)
+		{
+			fprint_dbus_device_call_claim(state_wrapper->device, "", NULL,
+										  open_device_async_device_claim_cb,
+										  state_wrapper);
+			return;
+		}
+
+		restart_fingerprint_usb_device(false, false);
+
+		struct FingerprintState *state = state_wrapper->state;
+		state_wrapper->state->openning_device = 0;
+		g_object_unref(state_wrapper->device);
+		g_free(state_wrapper->path);
+		g_free(state_wrapper);
+
+		state->restarting = true;
+		state->rebind_usb = true;
+		g_timeout_add_seconds(1, restart_verify_step_1, state);
 		return;
 	}
 
-	swaylock_log(LOG_DEBUG, "Fingerprint: using device %s", path);
-	dev = fprint_dbus_device_proxy_new_sync(
-		state->connection,
-		G_DBUS_PROXY_FLAGS_NONE,
-		"net.reactivated.Fprint",
-		path, NULL, &error);
+	swaylock_log(LOG_DEBUG, "FPrint device opened %s", state_wrapper->path);
+	state_wrapper->state->device = g_steal_pointer(&state_wrapper->device);
+	g_free(state_wrapper->path);
+	g_free(state_wrapper);
+}
+
+static void open_device_async_device_proxy_new_cb(GObject *source_object,
+												  GAsyncResult *res,
+												  gpointer data)
+{
+	struct FingerprintStateWithInitId *state_wrapper = data;
+	if (state_wrapper->init_id != state_wrapper->state->init_id)
+	{
+		g_free(state_wrapper->path);
+		g_free(state_wrapper);
+		return;
+	}
+	FprintDBusDevice *dev = NULL;
+	GError *error = NULL;
+	dev = fprint_dbus_device_proxy_new_finish(res, &error);
 	if (error)
 	{
-		swaylock_log(LOG_ERROR, "failed to connect to device: %s", error->message);
-		display_message(state, "Fingerprint error");
+		swaylock_log(LOG_ERROR, "failed to connect to device: %s (%d)", error->message, error->code);
+		display_message(state_wrapper->state, "FP EDC");
+		state_wrapper->state->openning_device = 0;
+		g_free(state_wrapper->path);
+		g_free(state_wrapper);
 		return;
 	}
 
-	if (!fprint_dbus_device_call_claim_sync(dev, "", NULL, &error))
+	state_wrapper->device = dev;
+	fprint_dbus_device_call_claim(dev, "", NULL,
+								  open_device_async_device_claim_cb,
+								  state_wrapper);
+}
+
+static void open_device_async_get_default_device_cb(GObject *source_object,
+													GAsyncResult *res,
+													gpointer data)
+{
+	struct FingerprintStateWithInitId *state_wrapper = data;
+	if (state_wrapper->init_id != state_wrapper->state->init_id)
 	{
-		// we need to wait while device can be claimed
-		swaylock_log(LOG_DEBUG, "failed to claim the device: %s(%d)", error->message, error->code);
+		g_free(state_wrapper);
 		return;
 	}
+	char *path = NULL;
+	GError *error = NULL;
 
-	swaylock_log(LOG_DEBUG, "FPrint device opened %s", path);
-	state->device = g_steal_pointer(&dev);
+	if (!fprint_dbus_manager_call_get_default_device_finish(state_wrapper->state->manager, &path, res, &error))
+	{
+		swaylock_log(LOG_ERROR, "open_device_async_get_default_device:Error: %s", error->message);
+		g_clear_error(&error);
+		display_message(state_wrapper->state, "FP ED");
+		int ntry = ++state_wrapper->state->open_device_fail_count;
+		if (ntry >= 2 && ntry <= 3)
+		{
+			restart_fingerprint_usb_device(ntry == 3, false);
+			if (!run_main_context(state_wrapper->init_id, state_wrapper->state, 3))
+			{
+				g_free(state_wrapper);
+				return;
+			}
+		}
+		if (ntry < 5)
+		{
+			fprint_dbus_manager_call_get_default_device(state_wrapper->state->manager, NULL,
+														open_device_async_get_default_device_cb,
+														state_wrapper);
+			return;
+		}
+		else
+		{
+			state_wrapper->state->openning_device = 0;
+			g_free(state_wrapper);
+			return;
+		}
+	}
+
+	swaylock_log(LOG_DEBUG, "Fingerprint: using device %s after %d queries", path, state_wrapper->state->open_device_fail_count);
+
+	state_wrapper->state->open_device_fail_count = 0;
+	state_wrapper->path = path;
+	fprint_dbus_device_proxy_new(state_wrapper->state->connection,
+								 G_DBUS_PROXY_FLAGS_NONE,
+								 "net.reactivated.Fprint",
+								 path,
+								 NULL,
+								 open_device_async_device_proxy_new_cb,
+								 state_wrapper);
+}
+
+static void open_device_async(struct FingerprintState *state)
+{
+	if (state->openning_device)
+	{
+		return;
+	}
+	int current_init_id = state->init_id;
+	state->device = NULL;
+	state->openning_device = 1;
+	g_autoptr(FprintDBusDevice) dev = NULL;
+	g_autoptr(GError) error = NULL;
+	state->open_device_fail_count = 0;
+	struct FingerprintStateWithInitId *state_wrapper = g_new(struct FingerprintStateWithInitId, 1);
+	state_wrapper->state = state;
+	state_wrapper->init_id = current_init_id;
+	state_wrapper->path = NULL;
+	state_wrapper->device = NULL;
+	fprint_dbus_manager_call_get_default_device(state->manager, NULL,
+												open_device_async_get_default_device_cb,
+												state_wrapper);
+}
+
+static void fingerprint_init2(struct FingerprintState *fingerprint_state)
+{
+	int current_init_id = ++fingerprint_state->init_id;
+	fingerprint_state->last_signal_time = time(NULL);
+	fingerprint_state->continous_unknown_error_count = 0;
+	fingerprint_state->openning_device = 0;
+	create_manager(fingerprint_state);
+	__time_t start_time = time(NULL);
+	__time_t last_try_time = start_time;
+	int try_count = 1;
+	while (fingerprint_state->manager == NULL || fingerprint_state->connection == NULL)
+	{
+		g_main_context_iteration(NULL, TRUE);
+		if (current_init_id != fingerprint_state->init_id)
+		{
+			return;
+		}
+		__time_t current_time = time(NULL);
+		if (try_count > 5 || current_time - start_time > 60)
+		{
+			swaylock_log(LOG_ERROR, "Failed to initialize fingerprint");
+			display_message(fingerprint_state, "FP2 Error");
+			return;
+		}
+		if (current_time - last_try_time > 3)
+		{
+			last_try_time = current_time;
+			++try_count;
+			if (try_count % 2 == 0)
+			{
+				restart_fingerprint_usb_device(false, false);
+			}
+			fingerprint_state->last_signal_time = time(NULL);
+			create_manager(fingerprint_state);
+		}
+	}
 }
 
 static gboolean restart_verify_step_2(gpointer user_data)
 {
+	swaylock_log(LOG_DEBUG, "Restarting verification step 2");
 	struct FingerprintState *state = user_data;
+	state->last_signal_time = time(NULL);
 	state->restart_count++;
+	state->restarting = false;
 	if (!should_disable_fingerprint(state))
 	{
+		fingerprint_init2(state);
+		display_message(state, "");
 		fingerprint_verify(state);
+	}
+	else
+	{
+		if (!*state->status)
+		{
+			display_message(state, "FP Disabled");
+		}
 	}
 	return G_SOURCE_REMOVE;
 }
@@ -125,17 +375,26 @@ static gboolean restart_verify_step_2(gpointer user_data)
 static gboolean restart_verify_step_1(gpointer user_data)
 {
 	struct FingerprintState *state = user_data;
+	state->last_signal_time = time(NULL);
+	state->init_id++;
+	swaylock_log(LOG_DEBUG, "Restarting verification step 1");
 	fingerprint_deinit(state);
 	state->started = 0;
 	state->completed = 0;
 	state->match = 0;
-	g_timeout_add_seconds(1, restart_verify_step_2, state);
+	if (state->rebind_usb)
+	{
+		state->rebind_usb = false;
+		restart_fingerprint_usb_device(false, false);
+	}
+	g_timeout_add_seconds_full(G_PRIORITY_HIGH, 1, restart_verify_step_2, state, NULL);
 	return G_SOURCE_REMOVE;
 }
 
 static void verify_result(GObject *object, const char *result, gboolean done, void *user_data)
 {
 	struct FingerprintState *state = user_data;
+	state->last_signal_time = time(NULL);
 	swaylock_log(LOG_INFO, "Verify result: %s (%s)", result, done ? "done" : "not done");
 
 	const char *status = NULL;
@@ -163,7 +422,10 @@ static void verify_result(GObject *object, const char *result, gboolean done, vo
 	}
 	else if (g_str_equal(result, "verify-unknown-error"))
 	{
-		should_restart = true;
+		if (++state->continous_unknown_error_count > 3)
+		{
+			should_restart = true;
+		}
 		status = "Unknown error";
 	}
 	else if (g_str_equal(result, "verify-disconnected"))
@@ -230,6 +492,8 @@ static void verify_result(GObject *object, const char *result, gboolean done, vo
 	else if (should_restart && !state->match)
 	{
 		swaylock_log(LOG_DEBUG, "Restarting verification");
+		state->restarting = true;
+		state->rebind_usb = true;
 		g_timeout_add_seconds(1, restart_verify_step_1, state);
 	}
 }
@@ -244,6 +508,8 @@ static void verify_started_cb(GObject *obj, GAsyncResult *res, gpointer user_dat
 
 	swaylock_log(LOG_DEBUG, "Verify started!");
 	state->started = TRUE;
+	if (!*state->status)
+		display_message(state, "...");
 }
 
 static void proxy_signal_cb(GDBusProxy *proxy,
@@ -253,13 +519,18 @@ static void proxy_signal_cb(GDBusProxy *proxy,
 							gpointer user_data)
 {
 	struct FingerprintState *state = user_data;
-	if (!state->started)
+	if (!state->started || state->restarting)
 	{
 		return;
 	}
 
-	if (!g_str_equal(signal_name, "VerifyStatus"))
+	if (g_str_equal(signal_name, "VerifyFingerSelected"))
 	{
+		return;
+	}
+	else if (!g_str_equal(signal_name, "VerifyStatus"))
+	{
+		swaylock_log(LOG_DEBUG, "Received unexpected signal %s", signal_name);
 		return;
 	}
 
@@ -275,6 +546,11 @@ static void start_verify(struct FingerprintState *state)
 	{
 		return;
 	}
+	if (state->restarting || !state->device)
+	{
+		return;
+	}
+	int current_init_id = state->init_id;
 	/* This one is funny. We connect to the signal immediately to avoid
 	 * race conditions. However, we must ignore any authentication results
 	 * that happen before our start call returns.
@@ -293,12 +569,16 @@ static void start_verify(struct FingerprintState *state)
 	while (!state->started && !state->error)
 	{
 		g_main_context_iteration(NULL, TRUE);
+		if (current_init_id != state->init_id)
+		{
+			return;
+		}
 	}
 
 	if (state->error)
 	{
 		swaylock_log(LOG_ERROR, "VerifyStart failed: %s", state->error->message);
-		display_message(state, "Fingerprint error");
+		display_message(state, "FP E5");
 		g_clear_error(&state->error);
 		return;
 	}
@@ -309,22 +589,82 @@ static void release_callback(GObject *source_object, GAsyncResult *res,
 {
 }
 
+static void handle_sleep_signal(GDBusProxy *proxy,
+								const gchar *sender_name,
+								const gchar *signal_name,
+								GVariant *parameters,
+								gpointer user_data)
+{
+	if (g_strcmp0(signal_name, "PrepareForSleep"))
+	{
+		return;
+	}
+	struct FingerprintState *state = user_data;
+	gboolean going_to_sleep;
+	g_variant_get(parameters, "(b)", &going_to_sleep);
+
+	if (!going_to_sleep)
+	{ // System is resuming
+		swaylock_log(LOG_DEBUG, "System resumed, restarting fingerprint verification.");
+		fingerprint_deinit(state);
+		fingerprint_init2(state);
+	}
+	else
+	{
+		swaylock_log(LOG_DEBUG, "System going to sleep, stopping fingerprint verification.");
+		fingerprint_deinit(state);
+	}
+}
+
 void fingerprint_init(struct FingerprintState *fingerprint_state,
 					  struct swaylock_state *swaylock_state)
 {
 	memset(fingerprint_state, 0, sizeof(struct FingerprintState));
 	fingerprint_state->sw_state = swaylock_state;
-	create_manager(fingerprint_state);
-	if (fingerprint_state->manager == NULL || fingerprint_state->connection == NULL)
-	{
-		return;
-	}
+
+	fingerprint_init2(fingerprint_state);
+
+	// Connect to the PrepareForSleep signal
+	GDBusProxy *login_manager_proxy = g_dbus_proxy_new_for_bus_sync(
+		G_BUS_TYPE_SYSTEM,
+		G_DBUS_PROXY_FLAGS_NONE,
+		NULL,
+		"org.freedesktop.login1",
+		"/org/freedesktop/login1",
+		"org.freedesktop.login1.Manager",
+		NULL, NULL);
+	g_signal_connect(login_manager_proxy, "g-signal",
+					 G_CALLBACK(handle_sleep_signal), fingerprint_state);
 }
 
 int fingerprint_verify(struct FingerprintState *fingerprint_state)
 {
+	int current_init_id = fingerprint_state->init_id;
 	/* VerifyStatus signals are processing, do not wait for completion. */
 	g_main_context_iteration(NULL, FALSE);
+	if (current_init_id != fingerprint_state->init_id)
+	{
+		return false;
+	}
+	if (fingerprint_state->restarting)
+	{
+		return false;
+	}
+
+	if (fingerprint_state->flag_idle_restart)
+	{
+		fingerprint_state->flag_idle_restart = 0;
+		if (!should_disable_fingerprint(fingerprint_state) && !fingerprint_state->match && !fingerprint_state->restarting && time(NULL) - fingerprint_state->last_signal_time > 60)
+		{
+			swaylock_log(LOG_DEBUG, "Restarting verification due to idle");
+
+			fingerprint_state->rebind_usb = false;
+			fingerprint_state->restarting = true;
+			restart_verify_step_1(fingerprint_state);
+			return false;
+		}
+	}
+
 	if (fingerprint_state->manager == NULL ||
 		fingerprint_state->connection == NULL)
 	{
@@ -333,12 +673,13 @@ int fingerprint_verify(struct FingerprintState *fingerprint_state)
 
 	if (fingerprint_state->device == NULL)
 	{
-		open_device(fingerprint_state);
-		if (fingerprint_state->device == NULL)
-		{
-			return false;
-		}
+		open_device_async(fingerprint_state);
+		return false;
+	}
 
+	if (!fingerprint_state->device_signal_connected)
+	{
+		fingerprint_state->device_signal_connected = true;
 		g_signal_connect(fingerprint_state->device, "g-signal", G_CALLBACK(proxy_signal_cb),
 						 fingerprint_state);
 		start_verify(fingerprint_state);
@@ -361,7 +702,7 @@ int fingerprint_verify(struct FingerprintState *fingerprint_state)
 	return true;
 }
 
-void fingerprint_deinit(struct FingerprintState *fingerprint_state)
+static void fingerprint_close_device(struct FingerprintState *fingerprint_state)
 {
 	if (!fingerprint_state->device)
 	{
@@ -372,4 +713,16 @@ void fingerprint_deinit(struct FingerprintState *fingerprint_state)
 										 fingerprint_state);
 	fprint_dbus_device_call_release(fingerprint_state->device, NULL, release_callback, NULL);
 	fingerprint_state->device = NULL;
+}
+
+void fingerprint_deinit(struct FingerprintState *fingerprint_state)
+{
+	fingerprint_state->init_id++;
+	fingerprint_close_device(fingerprint_state);
+	destroy_manager(fingerprint_state);
+}
+
+void fingerprint_set_restart_flag(struct FingerprintState *fingerprint_state)
+{
+	fingerprint_state->flag_idle_restart = 1;
 }

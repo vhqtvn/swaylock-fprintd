@@ -24,12 +24,24 @@
 
 struct FingerprintState {
 	GError	*error;
+	gboolean rebind_usb;
+	gboolean restarting;
 	gboolean started;
 	gboolean completed;
 	gboolean match;
 
+	gboolean flag_idle_restart;
+	gboolean openning_device;
+	gboolean device_signal_connected;
+
+	int open_device_fail_count;
+	int claim_device_fail_count;
+
+	int init_id;
+	int continous_unknown_error_count;
 	int fail_count;
 	int restart_count;
+	__time_t last_signal_time;
 
 	char status[128];
 
@@ -42,5 +54,6 @@ struct FingerprintState {
 void fingerprint_init(struct FingerprintState *fingerprint_state, struct swaylock_state *state);
 int fingerprint_verify(struct FingerprintState *fingerprint_state);
 void fingerprint_deinit(struct FingerprintState *fingerprint_state);
+void fingerprint_set_restart_flag(struct FingerprintState *fingerprint_state);
 
 #endif
