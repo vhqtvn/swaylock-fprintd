@@ -28,6 +28,9 @@ struct FingerprintState {
 	gboolean completed;
 	gboolean match;
 
+	int fail_count;
+	int restart_count;
+
 	char status[128];
 
 	FprintDBusManager *manager;
