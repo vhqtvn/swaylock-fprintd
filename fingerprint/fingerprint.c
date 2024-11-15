@@ -684,9 +684,9 @@ static void handle_sleep_signal(GDBusProxy *proxy,
 
 	if (!going_to_sleep)
 	{ // System is resuming
-		// swaylock_log(LOG_DEBUG, "System resumed, restarting fingerprint verification.");
-		// system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint-service");
+		swaylock_log(LOG_DEBUG, "System resumed, restarting fingerprint verification.");
 		fingerprint_deinit(state);
+		restart_fingerprint_usb_device(false, true);
 		fingerprint_init2(state);
 	}
 	else
