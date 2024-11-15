@@ -161,7 +161,7 @@ void swaylock_handle_key(struct swaylock_state *state,
 {
 	if (state->fingerprint_state)
 	{
-		fingerprint_set_restart_flag(state->fingerprint_state);
+		fingerprint_set_restart_flag(state->fingerprint_state, keysym == XKB_KEY_Escape);
 	}
 
 	switch (keysym)

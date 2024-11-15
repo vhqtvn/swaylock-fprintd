@@ -23,14 +23,18 @@
 #include "fingerprint/fprintd-dbus.h"
 
 struct FingerprintState {
+	gboolean initialized;
+
 	GError	*error;
 	gboolean rebind_usb;
 	gboolean restarting;
 	gboolean started;
 	gboolean completed;
 	gboolean match;
+	gboolean verifying;
 
-	gboolean flag_idle_restart;
+	// 1 - request to restart, 2 - force restart
+	int flag_idle_restart;
 	gboolean openning_device;
 	gboolean device_signal_connected;
 
@@ -42,6 +46,8 @@ struct FingerprintState {
 	int fail_count;
 	int restart_count;
 	__time_t last_signal_time;
+	__time_t last_start_verify_time;
+	__time_t last_activity_time;
 
 	char status[128];
 
@@ -54,6 +60,6 @@ struct FingerprintState {
 void fingerprint_init(struct FingerprintState *fingerprint_state, struct swaylock_state *state);
 int fingerprint_verify(struct FingerprintState *fingerprint_state);
 void fingerprint_deinit(struct FingerprintState *fingerprint_state);
-void fingerprint_set_restart_flag(struct FingerprintState *fingerprint_state);
+void fingerprint_set_restart_flag(struct FingerprintState *fingerprint_state, bool force);
 
 #endif
