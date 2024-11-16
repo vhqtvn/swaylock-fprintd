@@ -670,7 +670,7 @@ static void start_verify(struct FingerprintState *state)
 	}
 	else if (!*state->status)
 	{
-		display_message(state, "Scan your finger");
+		display_message(state, "...");
 	}
 }
 
