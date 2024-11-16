@@ -62,6 +62,7 @@ static const struct wl_callback_listener surface_frame_listener = {
 };
 
 static bool render_frame(struct swaylock_surface *surface);
+static bool render_fingerprint_status(struct swaylock_surface *surface);
 
 void render(struct swaylock_surface *surface)
 {
@@ -121,6 +122,7 @@ void render(struct swaylock_surface *surface)
 	}
 
 	render_frame(surface);
+	render_fingerprint_status(surface);
 	surface->dirty = false;
 	surface->frame = wl_surface_frame(surface->surface);
 	wl_callback_add_listener(surface->frame, &surface_frame_listener, surface);
@@ -154,6 +156,75 @@ static void configure_font_drawing(cairo_t *cairo, struct swaylock_state *state,
 	cairo_font_options_destroy(fo);
 }
 
+static bool render_fingerprint_status(struct swaylock_surface *surface)
+{
+	struct swaylock_state *state = surface->state;
+	if (!state)
+		return false;
+	const char *status = state->fingerprint_driver_msg;
+
+	if (!status || !*status)
+	{
+		return false;
+	}
+
+	swaylock_log(LOG_DEBUG, "Fingerprint status: %s", status);
+
+	const int SCREEN_PADDING = 10;
+	// draw the fingerprint status to the bottom left of the screen
+
+	// Compute the size of the buffer needed
+	int arch_radius = state->args.radius * surface->scale;
+	int buffer_width = 10;
+	int buffer_height = 10;
+	cairo_set_antialias(state->test_cairo, CAIRO_ANTIALIAS_BEST);
+	configure_font_drawing(state->test_cairo, state, surface->subpixel, arch_radius);
+
+	cairo_text_extents_t extents;
+	cairo_text_extents(state->test_cairo, status, &extents);
+	buffer_width = extents.width;
+	buffer_height = extents.height;
+
+	int padding = buffer_height / 4;
+
+	buffer_width += 2 * padding;
+	buffer_height += 2 * padding;
+
+	// Ensure buffer size is multiple of buffer scale - required by protocol
+	buffer_width += surface->scale - (buffer_width % surface->scale);
+	buffer_height += surface->scale - (buffer_height % surface->scale);
+
+	int subsurf_xpos = SCREEN_PADDING;
+	int subsurf_ypos = surface->height - buffer_height - SCREEN_PADDING;
+
+	struct pool_buffer *buffer = get_next_buffer(state->shm,
+												 surface->fingerprint_status_buffer, buffer_width, buffer_height);
+
+	if (buffer == NULL)
+	{
+		swaylock_log(LOG_ERROR, "No buffer");
+		return false;
+	}
+
+	// Render the buffer
+	cairo_t *cairo = buffer->cairo;
+	// fill the buffer with red to debug
+	cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
+	configure_font_drawing(cairo, state, surface->subpixel, arch_radius);
+	cairo_move_to(cairo, padding, buffer_height - padding);
+	cairo_set_source_rgb(cairo, 0.7, 0.7, 0.7);
+	cairo_show_text(cairo, status);
+
+	// Send Wayland requests
+	wl_subsurface_set_position(surface->fingerprint_subsurface, subsurf_xpos, subsurf_ypos);
+
+	wl_surface_set_buffer_scale(surface->fingerprint_status, surface->scale);
+	wl_surface_attach(surface->fingerprint_status, buffer->buffer, 0, 0);
+	wl_surface_damage_buffer(surface->fingerprint_status, 0, 0, INT32_MAX, INT32_MAX);
+	wl_surface_commit(surface->fingerprint_status);
+
+	return true;
+}
 static bool render_frame(struct swaylock_surface *surface)
 {
 	struct swaylock_state *state = surface->state;

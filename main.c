@@ -128,6 +128,14 @@ static void destroy_surface(struct swaylock_surface *surface)
 	{
 		wl_surface_destroy(surface->child);
 	}
+	if (surface->fingerprint_subsurface)
+	{
+		wl_subsurface_destroy(surface->fingerprint_subsurface);
+	}
+	if (surface->fingerprint_status)
+	{
+		wl_surface_destroy(surface->fingerprint_status);
+	}
 	if (surface->surface != NULL)
 	{
 		wl_surface_destroy(surface->surface);
@@ -163,9 +171,17 @@ static void create_surface(struct swaylock_surface *surface)
 
 	surface->child = wl_compositor_create_surface(state->compositor);
 	assert(surface->child);
+
 	surface->subsurface = wl_subcompositor_get_subsurface(state->subcompositor, surface->child, surface->surface);
 	assert(surface->subsurface);
 	wl_subsurface_set_sync(surface->subsurface);
+
+	surface->fingerprint_status = wl_compositor_create_surface(state->compositor);
+	assert(surface->fingerprint_status);
+
+	surface->fingerprint_subsurface = wl_subcompositor_get_subsurface(state->subcompositor, surface->fingerprint_status, surface->surface);
+	assert(surface->fingerprint_subsurface);
+	wl_subsurface_set_sync(surface->fingerprint_subsurface);
 
 	surface->ext_session_lock_surface_v1 = ext_session_lock_v1_get_lock_surface(
 		state->ext_session_lock_v1, surface->surface, surface->output);

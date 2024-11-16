@@ -51,6 +51,8 @@ struct FingerprintState {
 
 	char status[128];
 
+	char driver_status[128];
+
 	FprintDBusManager *manager;
 	GDBusConnection *connection;
 	FprintDBusDevice *device;

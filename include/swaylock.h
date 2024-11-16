@@ -104,6 +104,7 @@ struct swaylock_state {
 	struct ext_session_lock_manager_v1 *ext_session_lock_manager_v1;
 	struct ext_session_lock_v1 *ext_session_lock_v1;
 	char *fingerprint_msg;
+	char *fingerprint_driver_msg;
 	struct FingerprintState* fingerprint_state;
 };
 
@@ -113,10 +114,16 @@ struct swaylock_surface {
 	struct wl_output *output;
 	uint32_t output_global_name;
 	struct wl_surface *surface; // surface for background
+
 	struct wl_surface *child; // indicator surface made into subsurface
 	struct wl_subsurface *subsurface;
+
+	struct wl_surface *fingerprint_status; // indicator surface made into subsurface
+	struct wl_subsurface *fingerprint_subsurface;
+
 	struct ext_session_lock_surface_v1 *ext_session_lock_surface_v1;
 	struct pool_buffer indicator_buffers[2];
+	struct pool_buffer fingerprint_status_buffer[2];
 	bool created;
 	bool dirty;
 	uint32_t width, height;
