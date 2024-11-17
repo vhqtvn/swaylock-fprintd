@@ -168,8 +168,6 @@ static bool render_fingerprint_status(struct swaylock_surface *surface)
 		return false;
 	}
 
-	swaylock_log(LOG_DEBUG, "Fingerprint status: %s", status);
-
 	const int SCREEN_PADDING = 10;
 	// draw the fingerprint status to the bottom left of the screen
 

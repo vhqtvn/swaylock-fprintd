@@ -358,6 +358,55 @@ static void open_device_async(struct FingerprintState *state)
 												state_wrapper);
 }
 
+static bool is_suspending_or_hibernating_or_lid_closed()
+{
+	GError *error = NULL;
+	GDBusProxy *proxy = g_dbus_proxy_new_for_bus_sync(
+		G_BUS_TYPE_SYSTEM,
+		G_DBUS_PROXY_FLAGS_NONE,
+		NULL,
+		"org.freedesktop.login1",
+		"/org/freedesktop/login1",
+		"org.freedesktop.login1.Manager",
+		NULL, &error);
+
+	if (error)
+	{
+		g_error_free(error);
+		return false;
+	}
+
+	bool flag = false;
+	GVariant *result = g_dbus_proxy_get_cached_property(proxy, "PreparingForShutdown");
+	if (result)
+	{
+		flag = g_variant_get_boolean(result);
+		g_variant_unref(result);
+	}
+	if (!flag)
+	{
+		result = g_dbus_proxy_get_cached_property(proxy, "PreparingForSleep");
+		if (result)
+		{
+			flag = g_variant_get_boolean(result);
+			g_variant_unref(result);
+		}
+	}
+	if (!flag)
+	{
+		result = g_dbus_proxy_get_cached_property(proxy, "LidClosed");
+		if (result)
+		{
+			flag = g_variant_get_boolean(result);
+			g_variant_unref(result);
+		}
+	}
+
+	g_object_unref(proxy);
+
+	return flag;
+}
+
 static void fingerprint_init2(struct FingerprintState *fingerprint_state)
 {
 	int current_init_id = ++fingerprint_state->init_id;
@@ -367,6 +416,14 @@ static void fingerprint_init2(struct FingerprintState *fingerprint_state)
 	fingerprint_state->openning_device = 0;
 	fingerprint_state->verifying = false;
 	display_driver_message(fingerprint_state, "Initializing...");
+
+	// if device is suspending or hibernating, don't initialize
+	if (is_suspending_or_hibernating_or_lid_closed())
+	{
+		display_driver_message(fingerprint_state, "Suspended");
+		return;
+	}
+
 	create_manager(fingerprint_state);
 	__time_t start_time = time(NULL);
 	__time_t last_try_time = start_time;
