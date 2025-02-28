@@ -844,9 +844,14 @@ int fingerprint_verify(struct FingerprintState *fingerprint_state)
 	}
 	else
 	{
-		if (current_time - fingerprint_state->last_start_verify_time > 60 && fingerprint_state->verifying)
+		if (!fingerprint_state->initialized)
 		{
-			swaylock_log(LOG_DEBUG, "Idle verification timeout, disbaling fingerprint");
+			return false;
+		}
+		if (current_time - fingerprint_state->last_signal_time > 120 && !fingerprint_state->match)
+		{
+			swaylock_log(LOG_DEBUG, "Idle verification timeout, disabling fingerprint");
+			fingerprint_state->restarting = false;
 			fingerprint_deinit(fingerprint_state);
 			return false;
 		}

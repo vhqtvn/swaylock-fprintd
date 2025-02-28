@@ -1284,6 +1284,11 @@ static void check_fingerprint(void *d)
 
 int main(int argc, char **argv)
 {
+	// Disable input methods
+	setenv("XMODIFIERS", "@im=none", 1);
+	setenv("GTK_IM_MODULE", "none", 1);
+	setenv("QT_IM_MODULE", "none", 1);
+	
 	log_init(argc, argv);
 	initialize_pw_backend(argc, argv);
 	srand(time(NULL));
