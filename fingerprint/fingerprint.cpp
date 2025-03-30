@@ -116,12 +116,30 @@ public:
         {
             event_queue.pop();
         }
+
+        // Clear delayed tasks
+        delayed_tasks.clear();
     }
 
     void post(EventCallback callback)
     {
         std::lock_guard<std::mutex> lock(mutex);
         event_queue.push(std::move(callback));
+        cv.notify_one();
+    }
+
+    void postDelayed(int milliseconds, EventCallback callback)
+    {
+        auto execute_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        delayed_tasks.emplace_back(execute_time, std::move(callback));
+        // Sort to have the earliest task first
+        std::sort(delayed_tasks.begin(), delayed_tasks.end(),
+                  [](const DelayedTask &a, const DelayedTask &b)
+                  {
+                      return a.execute_time < b.execute_time;
+                  });
         cv.notify_one();
     }
 
@@ -188,11 +206,22 @@ public:
     }
 
 private:
+    // Structure to hold a delayed task
+    struct DelayedTask
+    {
+        std::chrono::steady_clock::time_point execute_time;
+        EventCallback callback;
+
+        DelayedTask(std::chrono::steady_clock::time_point time, EventCallback cb)
+            : execute_time(time), callback(std::move(cb)) {}
+    };
+
     void run()
     {
         while (running)
         {
-            wait_for_events(false, 250);
+            wait_for_events(false, 200);
+            processDelayedTasks();
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 if (!event_queue.empty() && running)
@@ -225,10 +254,42 @@ private:
         }
     }
 
+    void processDelayedTasks()
+    {
+        std::vector<EventCallback> tasks_to_execute;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (delayed_tasks.size() == 0)
+                return;
+            auto now = std::chrono::steady_clock::now();
+
+            // Find tasks that are due
+            auto it = delayed_tasks.begin();
+            while (it != delayed_tasks.end() && it->execute_time <= now)
+            {
+                tasks_to_execute.push_back(std::move(it->callback));
+                it = delayed_tasks.erase(it);
+            }
+        }
+
+        // Execute the tasks outside of the lock
+        if (tasks_to_execute.size() > 0)
+        {
+            g_main_context_push_thread_default(main_context);
+            for (auto &task : tasks_to_execute)
+            {
+                task();
+            }
+            g_main_context_pop_thread_default(main_context);
+        }
+    }
+
     std::thread worker_thread;
     std::mutex mutex;
     std::condition_variable cv;
     std::queue<EventCallback> event_queue;
+    std::vector<DelayedTask> delayed_tasks;
     std::atomic<bool> running;
 
     GMainContext *main_context = nullptr;
@@ -249,6 +310,7 @@ private:
     bool verifying;
     bool device_signal_connected;
     bool device_opening;
+    bool manager_creating;
 
     // Latest messages for UI updates
     struct DisplayMessage
@@ -418,6 +480,7 @@ private:
         if (pid == 0)
         {
             restartFingerprintUsbDevice_(full);
+            swaylock_log(LOG_DEBUG, "Fingerprint device restarted");
             exit(0);
         }
         else
@@ -461,6 +524,13 @@ private:
 
     void createManager()
     {
+        // Don't start another manager creation if one is already in progress with the same init_id
+        if (manager_creating)
+        {
+            swaylock_log(LOG_DEBUG, "Manager creation already in progress, skipping");
+            return;
+        }
+
         GError *error = nullptr;
 
         if (!connection)
@@ -477,27 +547,76 @@ private:
 
         if (!manager)
         {
-            manager = fprint_dbus_manager_proxy_new_sync(
+            int current_init_id = init_id;
+            manager_creating = true;
+            displayDriverMessage("Creating FPrint manager...");
+            swaylock_log(LOG_DEBUG, "Creating FPrint manager");
+
+            // Store the init_id to verify it hasn't changed when callback runs
+            fprint_dbus_manager_proxy_new(
                 connection,
                 G_DBUS_PROXY_FLAGS_NONE,
                 "net.reactivated.Fprint",
                 "/net/reactivated/Fprint/Manager",
-                nullptr, &error);
+                nullptr, // cancellable
+                [](GObject *source_object, GAsyncResult *res, gpointer user_data)
+                {
+                    auto *pair = static_cast<std::pair<FingerprintManager *, int> *>(user_data);
+                    auto *self = pair->first;
+                    int creation_init_id = pair->second;
 
-            if (!manager)
-            {
-                swaylock_log(LOG_ERROR, "Failed to get Fprintd manager: %s", error->message);
-                displayDriverMessage("Failed to get Fprintd manager: %s", error->message);
-                g_clear_error(&error);
-                return;
-            }
+                    // Call fprint_dbus_manager_proxy_new_finish here while res is valid
+                    GError *local_error = nullptr;
+                    FprintDBusManager *mgr = fprint_dbus_manager_proxy_new_finish(res, &local_error);
+
+                    // Post to event loop to ensure thread safety
+                    self->event_loop.post([self, mgr, creation_init_id, pair, local_error]()
+                                          {
+                        // Delete the pair object
+                        delete pair;
+
+                        // Skip if init_id has changed
+                        if (creation_init_id != self->init_id) {
+                            swaylock_log(LOG_DEBUG, "Init ID changed during manager creation, discarding result");
+                            if (local_error) {
+                                g_error_free(local_error);
+                            }
+                            if (mgr) {
+                                g_object_unref(mgr);
+                            }
+                            return;
+                        }
+                        
+                        // Always mark creation as complete first
+                        self->manager_creating = false;
+
+                        if (local_error) {
+                            swaylock_log(LOG_ERROR, "Failed to create FPrint manager: %s", local_error->message);
+                            self->displayDriverMessage("Failed to create FPrint manager: %s", local_error->message);
+                            g_error_free(local_error);
+                            return;
+                        }
+                        
+                        // Set the manager
+                        self->manager = mgr;
+                        swaylock_log(LOG_DEBUG, "FPrint manager created asynchronously");
+                        self->displayDriverMessage("FPrint manager ready");
+                        
+                        // Continue with device opening if needed
+                        if (self->initialized && !self->device) {
+                            self->openDeviceAsync();
+                        } });
+                },
+                new std::pair<FingerprintManager *, int>(this, current_init_id));
         }
-
-        swaylock_log(LOG_DEBUG, "FPrint manager created");
     }
 
     void destroyManager()
     {
+        // Don't reset manager_creating here, as it would allow new creation
+        // attempts while async operations might still be pending
+        // The flag should only be reset by the callback when the operation completes
+
         g_clear_object(&manager);
         g_clear_object(&connection);
     }
@@ -660,11 +779,8 @@ private:
             swaylock_log(LOG_DEBUG, "Restarting verification");
             restarting = true;
             rebind_usb = true;
-            g_timeout_add_seconds(1, [](gpointer user_data) -> gboolean
-                                  {
-                auto *self = static_cast<FingerprintManager*>(user_data);
-                self->restartVerifyStep1();
-                return G_SOURCE_REMOVE; }, this);
+            event_loop.postDelayed(1000, [this]()
+                                   { this->restartVerifyStep1(); });
         }
     }
 
@@ -753,11 +869,9 @@ private:
                     timeout_data->manager->displayDriverMessage("Failed to start verification (timeout)");
                     timeout_data->manager->restarting = true;
                     
-                    g_timeout_add_seconds(1, [](gpointer user_data) -> gboolean {
-                        auto *self = static_cast<FingerprintManager*>(user_data);
-                        self->restartVerifyStep1();
-                        return G_SOURCE_REMOVE;
-                    }, timeout_data->manager);
+                    timeout_data->manager->event_loop.postDelayed(1000, [timeout_data]() {
+                        timeout_data->manager->restartVerifyStep1();
+                    });
                     
                     delete timeout_data;
                 });
@@ -824,18 +938,13 @@ private:
                     g_error_free(local_error);
                     return;
                 }
-                self->displayDriverMessage("Restarting fingerprint device");
-                self->restartFingerprintUsbDevice(false, true);
-                self->displayDriverMessage("Restarted fingerprint device");
                 self->restarting = true;
                 self->rebind_usb = true;
                 self->device_opening = false;
 
-                g_timeout_add_seconds(1, [](gpointer user_data) -> gboolean {
-                    auto *self = static_cast<FingerprintManager*>(user_data);
+                self->event_loop.postDelayed(1000, [self]() {
                     self->restartVerifyStep1();
-                    return G_SOURCE_REMOVE;
-                }, self);
+                });
                 
                 g_error_free(local_error);
                 delete op;
@@ -1041,9 +1150,9 @@ private:
         }
 
         createManager();
-        displayDriverMessage("Manager created...");
-        // If we don't have a manager yet, keep trying
-        if (!manager || !connection)
+
+        // Handle the case where we failed to start manager creation
+        if (!manager && !manager_creating)
         {
             // Create a shared state object on the heap for the retries
             struct RetryState
@@ -1093,74 +1202,40 @@ private:
                     createManager();
                 }
 
-                // If still no manager, schedule another retry
-                if (!manager || !connection)
+                // If still no manager and no creation in progress, schedule another retry
+                if (!manager && !manager_creating)
                 {
                     event_loop.post([this, state]()
                                     {
-                        // Call the same lambda again
-                        auto retry_lambda = [this, state]() {
-                            if (state->init_id != init_id) {
-                                return;
-                            }
-                            
-                            time_t current_time = time(nullptr);
-                            if (state->try_count > 5 || current_time - state->start_time > 60) {
-                                swaylock_log(LOG_ERROR, "Failed to initialize fingerprint");
-                                displayDriverMessage("Failed to initialize fingerprint");
-                                return;
-                            }
-                            
-                            if (current_time - state->last_try_time > 3) {
-                                state->last_try_time = current_time;
-                                ++state->try_count;
-                                if (state->try_count % 2 == 0) {
-                                    restartFingerprintUsbDevice(false, true);
-                                }
-                                last_signal_time = time(nullptr);
-                                createManager();
-                            }
-                            
-                            // If still no manager, schedule another retry
-                            if (!manager || !connection) {
-                                event_loop.post([this, state]() {
-                                    // Schedule the next retry with a delay
-                                    g_timeout_add_seconds(1, [](gpointer user_data) -> gboolean {
-                                        auto *data = static_cast<std::pair<FingerprintManager*, std::shared_ptr<RetryState>>*>(user_data);
+                        // Schedule the next retry with a delay
+                        event_loop.postDelayed(1000, [this, state]() {
+                            auto *data = new std::pair<FingerprintManager*, std::shared_ptr<RetryState>>(this, state);
+                            data->first->event_loop.post([data]() {
+                                // Create a new retry task
+                                data->first->createManager();
+                                
+                                // If still no manager and not creating, schedule another retry
+                                if (!data->first->manager && !data->first->manager_creating) {
+                                    data->second->last_try_time = time(nullptr);
+                                    ++data->second->try_count;
+                                    
+                                    if (data->second->try_count % 2 == 0) {
+                                        data->first->restartFingerprintUsbDevice(false, true);
+                                    }
+                                    
+                                    // Check again after a delay
+                                    data->first->event_loop.postDelayed(3000, [data]() {
                                         data->first->event_loop.post([data]() {
-                                            // Create a new retry task
+                                            // Try to create manager again
                                             data->first->createManager();
-                                            
-                                            // If still no manager, schedule another retry
-                                            if (!data->first->manager || !data->first->connection) {
-                                                data->second->last_try_time = time(nullptr);
-                                                ++data->second->try_count;
-                                                
-                                                if (data->second->try_count % 2 == 0) {
-                                                    data->first->restartFingerprintUsbDevice(false, true);
-                                                }
-                                                
-                                                // Check again after a delay
-                                                g_timeout_add_seconds(3, [](gpointer user_data) -> gboolean {
-                                                    auto *data = static_cast<std::pair<FingerprintManager*, std::shared_ptr<RetryState>>*>(user_data);
-                                                    data->first->event_loop.post([data]() {
-                                                        // Try to create manager again
-                                                        data->first->createManager();
-                                                        delete data;
-                                                    });
-                                                    return G_SOURCE_REMOVE;
-                                                }, new std::pair<FingerprintManager*, std::shared_ptr<RetryState>>(data->first, data->second));
-                                            }
-                                            
                                             delete data;
                                         });
-                                        return G_SOURCE_REMOVE;
-                                    }, new std::pair<FingerprintManager*, std::shared_ptr<RetryState>>(this, state));
-                                });
-                            }
-                        };
-                        
-                        retry_lambda(); });
+                                    });
+                                }
+                                
+                                delete data;
+                            });
+                        }); });
                 }
             };
 
@@ -1196,6 +1271,8 @@ private:
     {
         last_signal_time = time(nullptr);
         init_id++;
+        // Reset the manager_creating flag when init_id changes
+        manager_creating = false;
         device_opening = false;
         swaylock_log(LOG_DEBUG, "Restarting verification step 1");
         fingerprint_deinit();
@@ -1206,17 +1283,11 @@ private:
             restartFingerprintUsbDevice(false, true);
         }
 
-        // Use g_timeout_add_seconds_full with the event loop context
-        g_timeout_add_seconds_full(G_PRIORITY_HIGH, 1, [](gpointer user_data) -> gboolean
-                                   {
-                auto *self = static_cast<FingerprintManager*>(user_data);
-                
-                // Post the restart task to the event loop
-                self->event_loop.post([self]() {
-                    self->restartVerifyStep2();
-                });
-                
-                return G_SOURCE_REMOVE; }, this, nullptr);
+        // Use event_loop.postDelayed instead of g_timeout_add_seconds_full
+        event_loop.postDelayed(1000, [this]()
+                               {
+            // Post the restart task to the event loop
+            this->restartVerifyStep2(); });
     }
 
     static void handleSleepSignal(GDBusProxy *proxy,
@@ -1298,6 +1369,7 @@ public:
           verifying(false),
           device_signal_connected(false),
           device_opening(false),
+          manager_creating(false),
           init_id(0),
           continuous_unknown_error_count(0),
           fail_count(0),
@@ -1459,6 +1531,8 @@ public:
         init_id++;
         verifying = false;
         device_opening = false;
+        // Reset manager_creating since we're explicitly deinitializing
+        manager_creating = false;
         closeDevice();
         destroyManager();
     }
@@ -1579,8 +1653,6 @@ extern "C"
         {
             return;
         }
-
-        swaylock_log(LOG_DEBUG, "setRestartFlag: %d", force);
 
         std::lock_guard<std::mutex> lock(*fp_state->mutex);
         fp_state->manager->setRestartFlag(force);

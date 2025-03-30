@@ -1286,6 +1286,31 @@ static void check_fingerprint(void *d)
 	loop_add_timer(state.eventloop, 300, check_fingerprint, fp_state);
 }
 
+// Handle crash signals to ensure unlock on crash
+static void handle_crash_signal(int signal) {
+    swaylock_log(LOG_ERROR, "Received signal %d; unlocking and exiting", signal);
+    if (state.ext_session_lock_v1) {
+        ext_session_lock_v1_unlock_and_destroy(state.ext_session_lock_v1);
+        wl_display_roundtrip(state.display);
+    }
+    exit(EXIT_FAILURE);
+}
+
+static void setup_crash_handlers(void) {
+    struct sigaction sa;
+    sa.sa_handler = handle_crash_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // Don't use SA_RESTART as we want to exit
+
+    // Setup handlers for common crash signals
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
 int main(int argc, char **argv)
 {
 	// Disable input methods
@@ -1434,6 +1459,9 @@ int main(int argc, char **argv)
 	state.ext_session_lock_v1 = ext_session_lock_manager_v1_lock(state.ext_session_lock_manager_v1);
 	ext_session_lock_v1_add_listener(state.ext_session_lock_v1,
 									 &ext_session_lock_v1_listener, &state);
+
+	// Setup crash handlers after creating the lock
+	setup_crash_handlers();
 
 	if (wl_display_roundtrip(state.display) == -1)
 	{
