@@ -1543,11 +1543,15 @@ int main(int argc, char **argv)
 
 	if (state.args.fingerprint)
 	{
-		fingerprint_deinit(fp_state);
+		swaylock_log(LOG_INFO, "Cleaning up fingerprint (1)");
 		fingerprint_set_is_running(fp_state, false);
+		swaylock_log(LOG_INFO, "Deinitializing fingerprint (2)");
+		fingerprint_deinit(fp_state);
+		swaylock_log(LOG_INFO, "Fingerprint deinitialized (3)");
 	}
 	free(state.args.font);
 	cairo_destroy(state.test_cairo);
 	cairo_surface_destroy(state.test_surface);
+	swaylock_log(LOG_INFO, "Exiting");
 	return 0;
 }

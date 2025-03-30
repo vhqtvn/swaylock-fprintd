@@ -59,7 +59,66 @@ public:
 
     ~EventLoop()
     {
-        stop();
+        // Ensure we signal the thread to stop before attempting to join it
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (running)
+            {
+                running = false;
+                cv.notify_all(); // Notify all waiting threads
+                if (main_loop)
+                {
+                    g_main_loop_quit(main_loop);
+                }
+            }
+        }
+
+        // Post a final empty task to ensure the thread exits any wait state
+        try
+        {
+            post([]() {});
+        }
+        catch (...)
+        {
+            // Ignore any exceptions during shutdown
+        }
+
+        // Wait a moment before joining to let the thread exit gracefully
+        if (worker_thread.joinable())
+        {
+            try
+            {
+                worker_thread.join();
+            }
+            catch (const std::system_error &e)
+            {
+                // Handle potential system errors during thread join
+            }
+        }
+
+        // Now it's safe to clean up GLib resources
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (main_loop)
+            {
+                g_main_loop_unref(main_loop);
+                main_loop = nullptr;
+            }
+
+            if (main_context)
+            {
+                g_main_context_unref(main_context);
+                main_context = nullptr;
+            }
+
+            // Clear the queues
+            while (!event_queue.empty())
+            {
+                event_queue.pop();
+            }
+
+            delayed_tasks.clear();
+        }
     }
 
     void start()
@@ -86,22 +145,35 @@ public:
             }
 
             running = false;
-            cv.notify_one();
+            cv.notify_all(); // Notify all waiting threads
+        }
 
-            if (main_loop)
-            {
-                g_main_loop_quit(main_loop);
-            }
+        // Post a no-op task to ensure the thread exits any wait state
+        try
+        {
+            post([]() {});
+        }
+        catch (...)
+        {
+            // Ignore any exceptions during shutdown
         }
 
         if (worker_thread.joinable())
         {
-            worker_thread.join();
+            try
+            {
+                worker_thread.join();
+            }
+            catch (const std::system_error &e)
+            {
+                // Handle potential system errors during thread join
+            }
         }
 
         std::lock_guard<std::mutex> lock(mutex);
         if (main_loop)
         {
+            g_main_loop_quit(main_loop);
             g_main_loop_unref(main_loop);
             main_loop = nullptr;
         }
@@ -200,11 +272,6 @@ public:
         }
     }
 
-    GMainContext *get_context() const
-    {
-        return main_context;
-    }
-
 private:
     // Structure to hold a delayed task
     struct DelayedTask
@@ -218,15 +285,22 @@ private:
 
     void run()
     {
+        // Push the main context at thread startup
+        g_main_context_push_thread_default(main_context);
+
         while (running)
         {
             wait_for_events(false, 200);
+            if (!running)
+                break;
             processDelayedTasks();
+            if (!running)
+                break;
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 if (!event_queue.empty() && running)
                 {
-                    g_main_context_push_thread_default(main_context);
+                    // No need to push/pop context here since we do it at thread level
                     while (!event_queue.empty() && running)
                     {
                         auto event = std::move(event_queue.front());
@@ -234,24 +308,25 @@ private:
                         lock.unlock();
 
                         // Execute the event callback
+                        if (!running)
+                            break;
                         event();
+                        if (!running)
+                            break;
 
                         lock.lock();
                     }
-                    g_main_context_pop_thread_default(main_context);
                 }
 
                 if (!running)
-                {
                     break;
-                }
             }
-
-            // Process GLib events
-            g_main_context_push_thread_default(main_context);
-            g_main_context_iteration(main_context, FALSE);
-            g_main_context_pop_thread_default(main_context);
         }
+
+        // Pop the context at thread exit - only once
+        // this will cause GLib-CRITICAL g_main_context_pop_thread_default: assertion 'g_queue_peek_head (stack) == context' failed
+        // g_main_context_pop_thread_default(main_context);
+        // we dont need this anw
     }
 
     void processDelayedTasks()
@@ -276,12 +351,11 @@ private:
         // Execute the tasks outside of the lock
         if (tasks_to_execute.size() > 0)
         {
-            g_main_context_push_thread_default(main_context);
+            // No need to push/pop context here as it's already pushed in run()
             for (auto &task : tasks_to_execute)
             {
                 task();
             }
-            g_main_context_pop_thread_default(main_context);
         }
     }
 
