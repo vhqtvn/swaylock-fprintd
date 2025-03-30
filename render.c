@@ -231,7 +231,7 @@ static bool render_frame(struct swaylock_surface *surface)
 	// determines the size/positioning of the surface
 
 	char attempts[4]; // like i3lock: count no more than 999
-	char *text = NULL;
+	const char *text = NULL;
 	const char *layout_text = NULL;
 
 	bool draw_indicator = state->args.show_indicator &&

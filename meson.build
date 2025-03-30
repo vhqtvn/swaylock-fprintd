@@ -1,11 +1,12 @@
 project(
 	'swaylock',
-	'c',
+	'c', 'cpp',
 	version: '1.8.0',
 	license: 'MIT',
 	meson_version: '>=0.59.0',
 	default_options: [
 		'c_std=c11',
+		'cpp_std=c++17',
 		'warning_level=2',
 		'werror=true',
 	],
@@ -21,7 +22,17 @@ add_project_arguments(
 	language: 'c',
 )
 
+add_project_arguments(
+	[
+		'-Wno-unused-parameter',
+		'-Wno-unused-result',
+		'-Wundef',
+	],
+	language: 'cpp',
+)
+
 cc = meson.get_compiler('c')
+cpp = meson.get_compiler('cpp')
 
 is_freebsd = host_machine.system().startswith('freebsd')
 

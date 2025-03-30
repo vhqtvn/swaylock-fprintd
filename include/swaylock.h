@@ -79,7 +79,7 @@ struct swaylock_password {
 	char *buffer;
 };
 
-struct FingerprintState;
+struct fingerprint_state;
 struct swaylock_state {
 	struct loop *eventloop;
 	struct loop_timer *input_idle_timer; // timer to reset input state to IDLE
@@ -103,9 +103,9 @@ struct swaylock_state {
 	bool run_display, locked;
 	struct ext_session_lock_manager_v1 *ext_session_lock_manager_v1;
 	struct ext_session_lock_v1 *ext_session_lock_v1;
-	char *fingerprint_msg;
-	char *fingerprint_driver_msg;
-	struct FingerprintState* fingerprint_state;
+	const char *fingerprint_msg;
+	const char *fingerprint_driver_msg;
+	struct fingerprint_state* fingerprint_state;
 };
 
 struct swaylock_surface {

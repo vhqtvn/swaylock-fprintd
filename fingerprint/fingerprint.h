@@ -16,52 +16,67 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
-#ifndef _FINGERPRINT_H
-#define _FINGERPRINT_H
+#pragma once
 
-#include "swaylock.h"
-#include "fingerprint/fprintd-dbus.h"
+// Forward declaration
+struct fingerprint_state;
+struct swaylock_state;
 
-struct FingerprintState {
-	gboolean initialized;
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
-	GError	*error;
-	gboolean rebind_usb;
-	gboolean restarting;
-	gboolean started;
-	gboolean completed;
-	gboolean match;
-	gboolean verifying;
+	/**
+	 * Initialize the fingerprint verification system
+	 *
+	 * @param swaylock_state The swaylock state to update during verification
+	 * @return Pointer to the internal fingerprint state
+	 */
+	struct fingerprint_state *fingerprint_init(struct swaylock_state *swaylock_state);
 
-	// 1 - request to restart, 2 - force restart
-	int flag_idle_restart;
-	gboolean openning_device;
-	gboolean device_signal_connected;
+	/**
+	 * Perform fingerprint verification
+	 *
+	 * @param fp_state Pointer to the fingerprint state
+	 * @return True if verified, false otherwise
+	 */
+	bool fingerprint_verify(struct fingerprint_state *fp_state);
 
-	int open_device_fail_count;
-	int claim_device_fail_count;
+	/**
+	 * Clean up and deinitialize the fingerprint system
+	 * This function also frees the fingerprint_state memory.
+	 * After calling this function, the fp_state pointer is no longer valid.
+	 *
+	 * @param fp_state Pointer to the fingerprint state
+	 */
+	void fingerprint_deinit(struct fingerprint_state *fp_state);
 
-	int init_id;
-	int continous_unknown_error_count;
-	int fail_count;
-	int restart_count;
-	__time_t last_signal_time;
-	__time_t last_start_verify_time;
-	__time_t last_activity_time;
+	/**
+	 * Flag the fingerprint system to restart
+	 *
+	 * @param fp_state Pointer to the fingerprint state
+	 * @param force If true, force a restart
+	 */
+	void fingerprint_set_restart_flag(struct fingerprint_state *fp_state, bool force);
 
-	char status[128];
+	/**
+	 * Set whether the fingerprint system is running
+	 *
+	 * @param fp_state Pointer to the fingerprint state
+	 * @param is_running True if running, false otherwise
+	 */
+	void fingerprint_set_is_running(struct fingerprint_state *fp_state, bool is_running);
 
-	char driver_status[128];
+	/**
+	 * Process pending display messages in the main thread
+	 * Call this function from the main thread to ensure UI updates
+	 * are properly handled in a thread-safe manner
+	 *
+	 * @param fp_state Pointer to the fingerprint state
+	 */
+	void fingerprint_process_display_messages(struct fingerprint_state *fp_state);
 
-	FprintDBusManager *manager;
-	GDBusConnection *connection;
-	FprintDBusDevice *device;
-	struct swaylock_state *sw_state;
-};
-
-void fingerprint_init(struct FingerprintState *fingerprint_state, struct swaylock_state *state);
-int fingerprint_verify(struct FingerprintState *fingerprint_state);
-void fingerprint_deinit(struct FingerprintState *fingerprint_state);
-void fingerprint_set_restart_flag(struct FingerprintState *fingerprint_state, bool force);
-
+#ifdef __cplusplus
+}
 #endif

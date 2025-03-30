@@ -1269,8 +1269,12 @@ void log_init(int argc, char **argv)
 
 static void check_fingerprint(void *d)
 {
-	struct FingerprintState *fingerprint_state = d;
-	if (fingerprint_verify(fingerprint_state))
+	struct fingerprint_state *fp_state = d;
+	
+	// Process any pending display messages in the main thread
+	fingerprint_process_display_messages(fp_state);
+	
+	if (fingerprint_verify(fp_state))
 	{
 		do_sigusr(1);
 	}
@@ -1279,7 +1283,7 @@ static void check_fingerprint(void *d)
 		(void)write(sigusr_fds[1], NULL, 0);
 	}
 
-	loop_add_timer(state.eventloop, 300, check_fingerprint, fingerprint_state);
+	loop_add_timer(state.eventloop, 300, check_fingerprint, fp_state);
 }
 
 int main(int argc, char **argv)
@@ -1483,12 +1487,12 @@ int main(int argc, char **argv)
 	sa.sa_flags = SA_RESTART;
 	sigaction(SIGUSR1, &sa, NULL);
 
-	struct FingerprintState fingerprint_state;
+	static struct fingerprint_state* fp_state;
 	if (state.args.fingerprint)
 	{
-		fingerprint_init(&fingerprint_state, &state);
-		loop_add_timer(state.eventloop, 100, check_fingerprint, &fingerprint_state);
-		state.fingerprint_state = &fingerprint_state;
+		fp_state = fingerprint_init(&state);
+		loop_add_timer(state.eventloop, 100, check_fingerprint, fp_state);
+		state.fingerprint_state = fp_state;
 	}
 	else
 	{
@@ -1511,7 +1515,8 @@ int main(int argc, char **argv)
 
 	if (state.args.fingerprint)
 	{
-		fingerprint_deinit(&fingerprint_state);
+		fingerprint_deinit(fp_state);
+		fingerprint_set_is_running(fp_state, false);
 	}
 	free(state.args.font);
 	cairo_destroy(state.test_cairo);
