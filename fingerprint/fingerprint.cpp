@@ -55,15 +55,19 @@ constexpr int MAX_UNKNOWN_ERROR_COUNT = 3;
 class EventLoop
 {
 private:
-    std::atomic<bool> main_loop_running;
+    std::atomic<bool> main_loop_running{false};
+    std::atomic<bool> running{false};
+    std::thread worker_thread;
+    std::mutex mutex;
+    GMainContext* main_context{nullptr};
+    GMainLoop* main_loop{nullptr};
+    std::atomic<size_t> next_id{0};
+    using EventCallback = std::function<void()>;
+    std::unordered_map<size_t, EventCallback> callbacks;
+    std::mutex callbacks_mutex;
 
 public:
-    using EventCallback = std::function<void()>;
-
-    size_t next_id = 0;
-    std::unordered_map<size_t, EventCallback> callbacks;
-
-    EventLoop() : main_loop_running(false), running(false) {}
+    EventLoop() = default;
 
     ~EventLoop()
     {
@@ -91,14 +95,17 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!running)
+            {
                 return;
+            }
 
             swaylock_log(LOG_DEBUG, "FP EventLoop::stop: quitting main loop");
             if (main_loop)
+            {
                 g_main_loop_quit(main_loop);
+            }
         }
 
-        swaylock_log(LOG_DEBUG, "FP EventLoop::stop: joining worker thread");
         if (worker_thread.joinable())
         {
             try
@@ -114,49 +121,22 @@ public:
                 swaylock_log(LOG_DEBUG, "FP EventLoop::stop: worker thread join failed");
             }
         }
-        if (worker_thread.joinable())
 
-            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unlocking mutex");
-        std::lock_guard<std::mutex> lock(mutex);
-        if (main_loop)
         {
-            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unrefing main loop");
-            g_main_loop_unref(main_loop);
-            main_loop = nullptr;
-        }
-
-        if (main_context)
-        {
-            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unrefing main context");
-            g_main_context_unref(main_context);
-            main_context = nullptr;
+            std::lock_guard<std::mutex> lock(mutex);
+            if (main_loop)
+            {
+                g_main_loop_unref(main_loop);
+                main_loop = nullptr;
+            }
+            if (main_context)
+            {
+                g_main_context_unref(main_context);
+                main_context = nullptr;
+            }
         }
 
         swaylock_log(LOG_DEBUG, "FP EventLoop::stop: done");
-    }
-
-    struct SelfWithId
-    {
-        EventLoop *self;
-        size_t id;
-    };
-
-    static gboolean timeoutCallback(void *data)
-    {
-        auto self_with_id = reinterpret_cast<SelfWithId *>(data);
-        auto it = self_with_id->self->callbacks.find(self_with_id->id);
-        if (it != self_with_id->self->callbacks.end())
-        {
-            auto callback = std::move(it->second);
-            self_with_id->self->callbacks.erase(it);
-            g_free(self_with_id);
-            callback();
-        }
-        else
-        {
-            g_free(self_with_id);
-        }
-        return FALSE;
     }
 
     void post(EventCallback callback)
@@ -167,12 +147,25 @@ public:
     void postDelayed(int milliseconds, EventCallback callback)
     {
         size_t id = next_id++;
-        callbacks[id] = std::move(callback);
-        SelfWithId *self_with_id = g_new0(SelfWithId, 1);
-        self_with_id->self = this;
-        self_with_id->id = id;
+        {
+            std::lock_guard<std::mutex> lock(callbacks_mutex);
+            callbacks[id] = std::move(callback);
+        }
+
+        struct TimeoutData
+        {
+            EventLoop *self;
+            size_t id;
+        };
+
+        auto *data = new TimeoutData{this, id};
         GSource *source = g_timeout_source_new(milliseconds);
-        g_source_set_callback(source, timeoutCallback, self_with_id, nullptr);
+        g_source_set_callback(source, [](void *user_data) -> gboolean
+                             {
+            auto *data = static_cast<TimeoutData *>(user_data);
+            data->self->executeCallback(data->id);
+            delete data;
+            return FALSE; }, data, nullptr);
         g_source_attach(source, main_context);
         g_source_unref(source);
     }
@@ -187,71 +180,53 @@ public:
                 run_immediately = true;
             }
         }
-        auto invoke_callback = [&]()
-        {
-            // the thread might have already been stopped
-            // try to run the callback immediately
-            try
-            {
-                callback();
-            }
-            catch (const std::exception &e)
-            {
-                swaylock_log(LOG_DEBUG, "FP EventLoop::postSyncImmediately: callback failed: %s", e.what());
-            }
-            catch (...)
-            {
-                swaylock_log(LOG_DEBUG, "FP EventLoop::postSyncImmediately: callback failed");
-            }
-        };
+
         if (run_immediately)
         {
-            invoke_callback();
+            executeCallbackSafely(std::move(callback));
             return;
         }
+
         std::condition_variable sync_cv;
         bool completed = false;
+        std::mutex sync_mutex;
 
-        // Create a wrapper that will signal completion
-        auto wrapper = [callback = std::move(callback), &sync_cv, &completed]()
+        auto wrapper = [callback = std::move(callback), &sync_cv, &completed, &sync_mutex]()
         {
-            // Run the original callback
-            callback();
-
-            // Signal completion
+            executeCallbackSafely(callback);
+            std::lock_guard<std::mutex> lock(sync_mutex);
             completed = true;
             sync_cv.notify_one();
         };
 
-        // Insert at the front of the queue
-        {
-            GSource *source = g_timeout_source_new(0);
-            g_source_set_priority(source, G_PRIORITY_HIGH);
-            g_source_set_callback(source, [](void *data)
-                                  {
-                auto callback = reinterpret_cast<EventCallback *>(data);
-                (*callback)();
-                delete callback;
-                return FALSE; }, reinterpret_cast<void *>(new EventCallback(std::move(wrapper))), nullptr);
-            g_source_attach(source, main_context);
-            g_source_unref(source);
-        }
+        GSource *source = g_timeout_source_new(0);
+        g_source_set_priority(source, G_PRIORITY_HIGH);
+        g_source_set_callback(source, [](void *data) -> gboolean
+                             {
+            auto *callback = static_cast<EventCallback *>(data);
+            (*callback)();
+            delete callback;
+            return FALSE; }, new EventCallback(std::move(wrapper)), nullptr);
+        g_source_attach(source, main_context);
+        g_source_unref(source);
 
+        std::unique_lock<std::mutex> lock(sync_mutex);
         for (int i = 0; i < 50; i++)
         {
-            std::mutex sync_mutex;
-            std::unique_lock<std::mutex> lock(sync_mutex);
-            // Wait for the job to complete
-            sync_cv.wait_for(lock, std::chrono::milliseconds(100), [&completed]
-                             { return completed; });
-            if (completed)
+            if (sync_cv.wait_for(lock, std::chrono::milliseconds(100), [&completed]
+                                 { return completed; }))
+            {
                 return;
+            }
             if (!main_loop_running.load())
+            {
                 break;
+            }
         }
+
         if (!main_loop_running.load() && !completed)
         {
-            invoke_callback();
+            executeCallbackSafely(std::move(callback));
         }
     }
 
@@ -266,33 +241,61 @@ private:
         main_loop_running.store(false);
     }
 
-    std::thread worker_thread;
-    std::mutex mutex;
-    std::atomic<bool> running;
+    void executeCallback(size_t id)
+    {
+        EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(callbacks_mutex);
+            auto it = callbacks.find(id);
+            if (it != callbacks.end())
+            {
+                callback = std::move(it->second);
+                callbacks.erase(it);
+            }
+        }
+        if (callback)
+        {
+            executeCallbackSafely(std::move(callback));
+        }
+    }
 
-    GMainContext *main_context = nullptr;
-    GMainLoop *main_loop = nullptr;
+    static void executeCallbackSafely(EventCallback callback)
+    {
+        try
+        {
+            callback();
+        }
+        catch (const std::exception &e)
+        {
+            swaylock_log(LOG_DEBUG, "FP EventLoop::executeCallbackSafely: callback failed: %s", e.what());
+        }
+        catch (...)
+        {
+            swaylock_log(LOG_DEBUG, "FP EventLoop::executeCallbackSafely: callback failed");
+        }
+    }
 };
 
 class FingerprintManager
 {
 private:
     struct swaylock_state *sw_state;
-    bool is_running;
-    bool initialized;
-    bool rebind_usb;
-    bool restarting;
-    bool started;
-    bool completed;
-    bool match;
-    bool verifying;
-    bool device_signal_connected;
-    bool device_opening;
-    bool manager_creating;
+    
+    // State flags
+    std::atomic<bool> is_running{true};
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> rebind_usb{false};
+    std::atomic<bool> restarting{false};
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    std::atomic<bool> match{false};
+    std::atomic<bool> verifying{false};
+    std::atomic<bool> device_signal_connected{false};
+    std::atomic<bool> device_opening{false};
+    std::atomic<bool> manager_creating{false};
 
-    // Latest messages for UI updates
-    struct DisplayMessage
-    {
+    // Message handling
+    struct DisplayMessage {
         std::string message;
         bool updated;
     };
@@ -300,118 +303,101 @@ private:
     DisplayMessage latest_message{std::string(), false};
     DisplayMessage latest_driver_message{std::string(), false};
 
-    int init_id;
-    int continuous_unknown_error_count;
-    int fail_count;
-    int restart_count;
-    int flag_idle_restart;
+    // Counters and timers
+    std::atomic<int> init_id{0};
+    std::atomic<int> continuous_unknown_error_count{0};
+    std::atomic<int> fail_count{0};
+    std::atomic<int> restart_count{0};
+    std::atomic<int> flag_idle_restart{0};
+    std::atomic<time_t> last_signal_time{0};
+    std::atomic<time_t> last_start_verify_time{0};
+    std::atomic<time_t> last_activity_time{0};
 
-    time_t last_signal_time;
-    time_t last_start_verify_time;
-    time_t last_activity_time;
+    // Status buffers
+    char status[128]{};
+    char driver_status[128]{};
 
-    char status[128];
-    char driver_status[128];
+    // D-Bus resources
+    GDBusConnection* connection{nullptr};
+    FprintDBusManager* manager{nullptr};
+    FprintDBusDevice* device{nullptr};
+    GError* error{nullptr};
 
-    GDBusConnection *connection;
-    FprintDBusManager *manager;
-    FprintDBusDevice *device;
-    GError *error;
+    // Static members
+    static std::atomic<int> restart_count_static;
+    static std::atomic<time_t> last_usb_restart_time;
+    static std::atomic<time_t> last_usb_full_restart_time;
 
-    static int restart_count_static;
-    static time_t last_usb_restart_time;
-    static time_t last_usb_full_restart_time;
-
-    // Event loop for GLib operations
+    // Event loop
     EventLoop event_loop;
 
-    class ClaimOperation
-    {
+    // Operation tracking
+    class ClaimOperation {
     public:
-        FingerprintManager *state;
+        FingerprintManager* state;
         int init_id;
-        char *path;
-        FprintDBusDevice *device;
+        char* path;
+        FprintDBusDevice* device;
 
-        ClaimOperation(FingerprintManager *state, int init_id)
+        ClaimOperation(FingerprintManager* state, int init_id)
             : state(state), init_id(init_id), path(nullptr), device(nullptr) {}
 
-        ~ClaimOperation()
-        {
+        ~ClaimOperation() {
             g_free(path);
-            if (device)
-            {
+            if (device) {
                 g_object_unref(device);
             }
         }
     };
 
-    void displayMessage(const char *fmt, ...)
-    {
+    // Helper functions
+    void displayMessage(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
         char buffer[256];
         vsnprintf(buffer, sizeof(buffer), fmt, args);
         va_end(args);
 
-        // Store the latest message
-        {
-            std::lock_guard<std::mutex> lock(message_mutex);
-            latest_message.message = buffer;
-            latest_message.updated = true;
-        }
+        std::lock_guard<std::mutex> lock(message_mutex);
+        latest_message.message = buffer;
+        latest_message.updated = true;
     }
 
-    void displayDriverMessage(const char *fmt, ...)
-    {
+    void displayDriverMessage(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
         char buffer[256];
         vsnprintf(buffer, sizeof(buffer), fmt, args);
         va_end(args);
 
-        // Store the latest driver message
-        {
-            std::lock_guard<std::mutex> lock(message_mutex);
-            latest_driver_message.message = buffer;
-            latest_driver_message.updated = true;
-        }
+        std::lock_guard<std::mutex> lock(message_mutex);
+        latest_driver_message.message = buffer;
+        latest_driver_message.updated = true;
     }
 
-    bool shouldDisableFingerprint() const
-    {
+    bool shouldDisableFingerprint() const {
         return fail_count >= MAX_FAIL_COUNT || restart_count >= MAX_RESTART_COUNT;
     }
 
-    bool sleepFor(int check_init_id, int seconds)
-    {
-        // Sleep for the specified number of seconds, checking init_id periodically
-        for (int i = 0; i < seconds && check_init_id == init_id; i++)
-        {
+    bool sleepFor(int check_init_id, int seconds) {
+        for (int i = 0; i < seconds && check_init_id == init_id; i++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         return check_init_id == init_id;
     }
 
-    static void restartFingerprintUsbDevice_(bool full)
-    {
-        if (full)
-        {
+    static void restartFingerprintUsbDevice_(bool full) {
+        if (full) {
             system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint full");
-        }
-        else
-        {
+        } else {
             system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint");
         }
     }
 
-    static void forceKill(pid_t pid)
-    {
+    static void forceKill(pid_t pid) {
         kill(pid, SIGKILL);
-        for (int i = 0; i < 10; i++)
-        {
-            if (waitpid(pid, nullptr, WNOHANG))
-            {
+        for (int i = 0; i < 10; i++) {
+            if (waitpid(pid, nullptr, WNOHANG)) {
                 return;
             }
             g_usleep(100000);
@@ -420,28 +406,23 @@ private:
         waitpid(pid, nullptr, 0);
     }
 
-    void restartFingerprintUsbDevice(bool full, bool wait)
-    {
+    void restartFingerprintUsbDevice(bool full, bool wait) {
         swaylock_log(LOG_DEBUG, "Restarting fingerprint device full=%d", full);
         time_t current_time = time(nullptr);
 
-        if (current_time - last_usb_full_restart_time < 3)
-        {
+        if (current_time - last_usb_full_restart_time < 3) {
             swaylock_log(LOG_DEBUG, "Skipping fingerprint device restart");
             return;
         }
 
-        if (current_time - last_usb_restart_time < 3 || restart_count_static >= 1)
-        {
-            if (!full)
-            {
+        if (current_time - last_usb_restart_time < 3 || restart_count_static >= 1) {
+            if (!full) {
                 full = true;
             }
         }
 
         last_usb_restart_time = current_time;
-        if (full)
-        {
+        if (full) {
             last_usb_full_restart_time = current_time;
         }
 
@@ -449,27 +430,20 @@ private:
         int max_wait_time = wait ? 120 : 5;
 
         pid_t pid = fork();
-        if (pid < 0)
-        {
+        if (pid < 0) {
             restartFingerprintUsbDevice_(full);
             return;
         }
 
-        if (pid == 0)
-        {
+        if (pid == 0) {
             restartFingerprintUsbDevice_(full);
             swaylock_log(LOG_DEBUG, "Fingerprint device restarted");
             exit(0);
-        }
-        else
-        {
-            // Use a separate thread to wait for the child process without blocking
-            std::thread wait_thread([this, pid, max_wait_time]()
-                                    {
+        } else {
+            std::thread wait_thread([this, pid, max_wait_time]() {
                 time_t start_time = time(nullptr);
                 while (waitpid(pid, nullptr, WNOHANG) == 0 && 
                        time(nullptr) - start_time < max_wait_time) {
-                    // No need for g_main_context_iteration here
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     if (!is_running) {
                         break;
@@ -495,27 +469,22 @@ private:
                             exit(0);
                         }
                     }
-                } });
-            wait_thread.detach(); // Let it run independently
+                }
+            });
+            wait_thread.detach();
         }
     }
 
-    void createManager()
-    {
-        // Don't start another manager creation if one is already in progress with the same init_id
-        if (manager_creating)
-        {
+    void createManager() {
+        if (manager_creating) {
             swaylock_log(LOG_DEBUG, "Manager creation already in progress, skipping");
             return;
         }
 
-        GError *error = nullptr;
-
-        if (!connection)
-        {
+        GError* error = nullptr;
+        if (!connection) {
             connection = g_bus_get_sync(G_BUS_TYPE_SYSTEM, nullptr, &error);
-            if (!connection)
-            {
+            if (!connection) {
                 swaylock_log(LOG_ERROR, "Failed to connect to session bus: %s", error->message);
                 displayDriverMessage("Failed to connect to session bus: %s", error->message);
                 g_clear_error(&error);
@@ -523,49 +492,42 @@ private:
             }
         }
 
-        if (!manager)
-        {
+        if (!manager) {
             int current_init_id = init_id;
             manager_creating = true;
             displayDriverMessage("Creating FPrint manager...");
             swaylock_log(LOG_DEBUG, "Creating FPrint manager");
 
-            // Store the init_id to verify it hasn't changed when callback runs
+            struct ManagerCreationData {
+                FingerprintManager* self;
+                int init_id;
+            };
+
+            auto* data = new ManagerCreationData{this, current_init_id};
+
             fprint_dbus_manager_proxy_new(
                 connection,
                 G_DBUS_PROXY_FLAGS_NONE,
                 "net.reactivated.Fprint",
                 "/net/reactivated/Fprint/Manager",
-                nullptr, // cancellable
-                [](GObject *source_object, GAsyncResult *res, gpointer user_data)
-                {
-                    auto *pair = static_cast<std::pair<FingerprintManager *, int> *>(user_data);
-                    auto *self = pair->first;
-                    int creation_init_id = pair->second;
+                nullptr,
+                [](GObject* source_object, GAsyncResult* res, gpointer user_data) {
+                    auto* data = static_cast<ManagerCreationData*>(user_data);
+                    auto* self = data->self;
 
-                    // Call fprint_dbus_manager_proxy_new_finish here while res is valid
-                    GError *local_error = nullptr;
-                    FprintDBusManager *mgr = fprint_dbus_manager_proxy_new_finish(res, &local_error);
+                    GError* local_error = nullptr;
+                    FprintDBusManager* mgr = fprint_dbus_manager_proxy_new_finish(res, &local_error);
 
-                    // Post to event loop to ensure thread safety
-                    self->event_loop.post([self, mgr, creation_init_id, pair, local_error]()
-                                          {
-                        // Delete the pair object
-                        delete pair;
+                    self->event_loop.post([self, mgr, data, local_error]() {
+                        delete data;
 
-                        // Skip if init_id has changed
-                        if (creation_init_id != self->init_id) {
+                        if (data->init_id != self->init_id) {
                             swaylock_log(LOG_DEBUG, "Init ID changed during manager creation, discarding result");
-                            if (local_error) {
-                                g_error_free(local_error);
-                            }
-                            if (mgr) {
-                                g_object_unref(mgr);
-                            }
+                            if (local_error) g_error_free(local_error);
+                            if (mgr) g_object_unref(mgr);
                             return;
                         }
-                        
-                        // Always mark creation as complete first
+
                         self->manager_creating = false;
 
                         if (local_error) {
@@ -574,230 +536,189 @@ private:
                             g_error_free(local_error);
                             return;
                         }
-                        
-                        // Set the manager
+
                         self->manager = mgr;
                         swaylock_log(LOG_DEBUG, "FPrint manager created asynchronously");
                         self->displayDriverMessage("FPrint manager ready");
-                        
-                        // Continue with device opening if needed
+
                         if (self->initialized && !self->device) {
                             self->openDeviceAsync();
-                        } });
+                        }
+                    });
                 },
-                new std::pair<FingerprintManager *, int>(this, current_init_id));
+                data);
         }
     }
 
-    void destroyManager()
-    {
-        // Don't reset manager_creating here, as it would allow new creation
-        // attempts while async operations might still be pending
-        // The flag should only be reset by the callback when the operation completes
-
+    void destroyManager() {
         g_clear_object(&manager);
         g_clear_object(&connection);
     }
 
-    static void proxySignalCb(GDBusProxy *proxy,
-                              const gchar *sender_name,
-                              const gchar *signal_name,
-                              GVariant *parameters,
-                              gpointer user_data)
-    {
-        auto *self = static_cast<FingerprintManager *>(user_data);
+    static void proxySignalCb(GDBusProxy* proxy,
+                            const gchar* sender_name,
+                            const gchar* signal_name,
+                            GVariant* parameters,
+                            gpointer user_data) {
+        auto* self = static_cast<FingerprintManager*>(user_data);
 
-        if (!self->started || self->restarting)
-        {
+        if (!self->started || self->restarting) {
             return;
         }
 
-        if (g_str_equal(signal_name, "VerifyFingerSelected"))
-        {
+        if (g_str_equal(signal_name, "VerifyFingerSelected")) {
             return;
         }
-        else if (!g_str_equal(signal_name, "VerifyStatus"))
-        {
+        if (!g_str_equal(signal_name, "VerifyStatus")) {
             swaylock_log(LOG_DEBUG, "Received unexpected signal %s", signal_name);
             return;
         }
 
-        const gchar *result;
+        const gchar* result;
         gboolean done;
         g_variant_get(parameters, "(&sb)", &result, &done);
 
-        // Make a copy of the result string since it might not be valid outside this callback
         std::string result_str(result);
-
-        // Post the event to be processed in the event loop thread
-        self->event_loop.post([self, result_str, done]()
-                              { self->verifyResult(result_str.c_str(), done); });
+        self->event_loop.post([self, result_str, done]() {
+            self->verifyResult(result_str.c_str(), done);
+        });
     }
 
-    void verifyResult(const char *result, bool done)
-    {
+    void verifyResult(const char* result, bool done) {
         last_signal_time = time(nullptr);
         swaylock_log(LOG_INFO, "Verify result: %s (%s)", result, done ? "done" : "not done");
 
-        const char *status = nullptr;
+        const char* status = nullptr;
         match = g_str_equal(result, "verify-match");
         bool should_restart = false;
         bool is_unknown = false;
 
-        if (g_str_equal(result, "verify-retry-scan"))
-        {
+        if (g_str_equal(result, "verify-retry-scan")) {
             continuous_unknown_error_count = 0;
             displayMessage("Retry");
             return;
         }
-        else if (g_str_equal(result, "verify-swipe-too-short"))
-        {
+        if (g_str_equal(result, "verify-swipe-too-short")) {
             continuous_unknown_error_count = 0;
             displayMessage("Retry, too short");
             return;
         }
-        else if (g_str_equal(result, "verify-finger-not-centered"))
-        {
+        if (g_str_equal(result, "verify-finger-not-centered")) {
             continuous_unknown_error_count = 0;
             displayMessage("Retry, not centered");
             return;
         }
-        else if (g_str_equal(result, "verify-remove-and-retry"))
-        {
+        if (g_str_equal(result, "verify-remove-and-retry")) {
             continuous_unknown_error_count = 0;
             displayMessage("Remove and retry");
             return;
         }
-        else if (g_str_equal(result, "verify-unknown-error"))
-        {
-            if (++continuous_unknown_error_count > MAX_UNKNOWN_ERROR_COUNT)
-            {
+        if (g_str_equal(result, "verify-unknown-error")) {
+            if (++continuous_unknown_error_count > MAX_UNKNOWN_ERROR_COUNT) {
                 should_restart = true;
             }
             is_unknown = true;
             status = "Unknown error";
         }
-        else if (g_str_equal(result, "verify-disconnected"))
-        {
+        else if (g_str_equal(result, "verify-disconnected")) {
             status = "Device disconnected";
         }
-        else if (g_str_equal(result, "verify-match"))
-        {
+        else if (g_str_equal(result, "verify-match")) {
             continuous_unknown_error_count = 0;
         }
-        else if (g_str_equal(result, "verify-no-match"))
-        {
+        else if (g_str_equal(result, "verify-no-match")) {
             continuous_unknown_error_count = 0;
             fail_count++;
         }
-        else
-        {
+        else {
             status = result;
         }
 
         bool kill = false;
-        if (shouldDisableFingerprint())
-        {
+        if (shouldDisableFingerprint()) {
             status = "FP Disabled";
             should_restart = false;
             kill = true;
         }
 
-        if (status)
-        {
-            if (match)
-            {
+        if (status) {
+            if (match) {
                 displayMessage("FP OK: %s", status);
             }
-            else if (is_unknown)
-            {
-                displayMessage("FP Failed (%d): %s", continuous_unknown_error_count, status);
+            else if (is_unknown) {
+                displayMessage("FP Failed (%d): %s", continuous_unknown_error_count.load(), status);
             }
-            else
-            {
-                displayMessage("FP Failed (%d): %s", fail_count, status);
+            else {
+                displayMessage("FP Failed (%d): %s", fail_count.load(), status);
             }
         }
-        else
-        {
-            if (match)
-            {
+        else {
+            if (match) {
                 displayMessage("FP OK");
             }
-            else
-            {
-                displayMessage("FP Failed (%d)", fail_count);
+            else {
+                displayMessage("FP Failed (%d)", fail_count.load());
             }
         }
 
         completed = true;
         verifying = false;
 
-        GError *error = nullptr;
-        if (!fprint_dbus_device_call_verify_stop_sync(device, nullptr, &error))
-        {
+        GError* error = nullptr;
+        if (!fprint_dbus_device_call_verify_stop_sync(device, nullptr, &error)) {
             swaylock_log(LOG_ERROR, "VerifyStop failed: %s", error->message);
             displayDriverMessage("Failed to stop verification: %s", error->message);
             g_clear_error(&error);
             return;
         }
 
-        if (kill)
-        {
+        if (kill) {
             fingerprint_deinit();
         }
-        else if (should_restart && !match)
-        {
+        else if (should_restart && !match) {
             time_t current_time = time(nullptr);
-            if (current_time - last_activity_time > 60)
-            {
+            if (current_time - last_activity_time > 60) {
                 fingerprint_deinit();
                 return;
             }
             swaylock_log(LOG_DEBUG, "Restarting verification");
             restarting = true;
             rebind_usb = true;
-            event_loop.postDelayed(1000, [this]()
-                                   { this->restartVerifyStep1(); });
+            event_loop.postDelayed(1000, [this]() {
+                this->restartVerifyStep1();
+            });
         }
     }
 
-    static void verifyStartedCb(GObject *obj, GAsyncResult *res, gpointer user_data)
-    {
-        auto *self = static_cast<FingerprintManager *>(user_data);
+    static void verifyStartedCb(GObject* obj, GAsyncResult* res, gpointer user_data) {
+        auto* self = static_cast<FingerprintManager*>(user_data);
 
-        // Create a local variable for the error
-        GError *local_error = nullptr;
+        GError* local_error = nullptr;
         bool success = fprint_dbus_device_call_verify_start_finish(FPRINT_DBUS_DEVICE(obj), res, &local_error);
 
-        // Post the result to the event loop
-        self->event_loop.post([self, success, local_error]()
-                              {
+        self->event_loop.post([self, success, local_error]() {
             if (local_error) {
-                // Transfer the error to the manager's error field
                 if (self->error) {
                     g_error_free(self->error);
                 }
                 self->error = local_error;
                 return;
             }
-            
+
             if (success) {
                 swaylock_log(LOG_DEBUG, "Verify started!");
                 self->started = true;
                 self->displayDriverMessage("Scan your finger");
-            } });
+            }
+        });
     }
 
-    void startVerify()
-    {
-        if (shouldDisableFingerprint())
-        {
+    void startVerify() {
+        if (shouldDisableFingerprint()) {
             return;
         }
 
-        if (verifying || restarting || !device)
-        {
+        if (verifying || restarting || !device) {
             return;
         }
 
@@ -810,35 +731,28 @@ private:
 
         int current_init_id = init_id;
 
-        // Create a shared pointer to the cancellable
-        std::shared_ptr<GCancellable> cancellable(g_cancellable_new(),
-                                                  [](GCancellable *c)
-                                                  { g_object_unref(c); });
-
-        // Create a timeout structure
-        struct TimeoutData
-        {
-            FingerprintManager *manager;
+        struct TimeoutData {
+            FingerprintManager* manager;
             int init_id;
             std::shared_ptr<GCancellable> cancellable;
         };
 
-        auto timeout_data = new TimeoutData{this, current_init_id, cancellable};
+        auto* timeout_data = new TimeoutData{
+            this,
+            current_init_id,
+            std::shared_ptr<GCancellable>(g_cancellable_new(), g_object_unref)
+        };
 
-        fprint_dbus_device_call_verify_start(device, "any", cancellable.get(),
-                                             verifyStartedCb, this);
+        fprint_dbus_device_call_verify_start(device, "any", timeout_data->cancellable.get(),
+                                          verifyStartedCb, this);
 
-        // Create a timeout thread that releases itself
-        std::thread([timeout_data]()
-                    {
-            // Wait for 10 seconds maximum
+        std::thread([timeout_data]() {
             for (int i = 0; i < 100 && !timeout_data->manager->started && 
-                              !timeout_data->manager->error && 
-                              timeout_data->init_id == timeout_data->manager->init_id; i++) {
+                          !timeout_data->manager->error && 
+                          timeout_data->init_id == timeout_data->manager->init_id; i++) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            
-            // If not started and no error, cancel
+
             if (!timeout_data->manager->started && !timeout_data->manager->error && 
                 timeout_data->init_id == timeout_data->manager->init_id) {
                 timeout_data->manager->event_loop.post([timeout_data]() {
@@ -846,34 +760,31 @@ private:
                     swaylock_log(LOG_ERROR, "VerifyStart timeout");
                     timeout_data->manager->displayDriverMessage("Failed to start verification (timeout)");
                     timeout_data->manager->restarting = true;
-                    
+
                     timeout_data->manager->event_loop.postDelayed(1000, [timeout_data]() {
                         timeout_data->manager->restartVerifyStep1();
                     });
-                    
+
                     delete timeout_data;
                 });
             } else {
                 delete timeout_data;
-            } })
-            .detach();
+            }
+        }).detach();
 
-        // Schedule a task to check the result after the callback
-        event_loop.post([this]()
-                        {
+        event_loop.post([this]() {
             if (error) {
                 swaylock_log(LOG_ERROR, "VerifyStart failed: %s", error->message);
                 displayDriverMessage("Failed to start verification: %s", error->message);
                 g_clear_error(&error);
             } else if (!*status) {
                 displayMessage("...");
-            } });
+            }
+        });
     }
 
-    void connectSignalAndStartVerify()
-    {
-        if (!device_signal_connected)
-        {
+    void connectSignalAndStartVerify() {
+        if (!device_signal_connected) {
             device_signal_connected = true;
             g_signal_connect(device, "g-signal", G_CALLBACK(proxySignalCb), this);
             startVerify();
@@ -897,35 +808,13 @@ private:
         GError *local_error = nullptr;
         bool success = fprint_dbus_device_call_claim_finish(op->device, res, &local_error);
 
-        // Post the result to the event loop
-        self->event_loop.post([self, op, success, local_error]() mutable
-                              {
-            if (!success) {
-                swaylock_log(LOG_ERROR, "failed to claim the device: %s(%d)", local_error->message, local_error->code);
-                self->displayDriverMessage("Claim failed (%d): %s", self->restart_count, local_error->message);
-                
-                int claim_fail_count = ++self->restart_count;
-                if (claim_fail_count < 3 
-                && !strstr(local_error->message, "Entity not found")
-                // && !strstr(local_error->message, "is already open")
-                ) {
-                    // Try again
-                    swaylock_log(LOG_DEBUG, "Try again to claim the device");
-                    fprint_dbus_device_call_claim(op->device, "", nullptr,
-                                                openDeviceAsyncDeviceClaimCb, op);
-                    g_error_free(local_error);
-                    return;
+        self->event_loop.post([self, success, local_error, op]() {
+            if (local_error) {
+                if (self->error) {
+                    g_error_free(self->error);
                 }
-                self->restarting = true;
-                self->rebind_usb = true;
-                self->device_opening = false;
-
-                self->event_loop.postDelayed(1000, [self]() {
-                    self->restartVerifyStep1();
-                });
-                
-                g_error_free(local_error);
-                delete op;
+                self->error = local_error;
+                self->displayDriverMessage("Claim failed (%d): %s", self->restart_count.load(), local_error->message);
                 return;
             }
 
@@ -933,7 +822,8 @@ private:
             self->device = g_object_ref(op->device);
             self->device_opening = false;
             self->connectSignalAndStartVerify();
-            delete op; });
+            delete op;
+        });
     }
 
     static void openDeviceAsyncDeviceProxyNewCb(GObject *source_object,
@@ -995,7 +885,7 @@ private:
                               {
             if (!success) {
                 swaylock_log(LOG_ERROR, "openDeviceAsyncGetDefaultDevice:Error: %s", local_error->message);
-                self->displayDriverMessage("Failed to get default device (%d): %s", self->restart_count, local_error->message);
+                self->displayDriverMessage("Failed to get default device (%d): %s", self->restart_count.load(), local_error->message);
                 
                 int open_fail_count = ++self->restart_count;
                 if (open_fail_count >= 2 && open_fail_count <= 3) {
@@ -1419,7 +1309,7 @@ public:
 
             if (!shouldDisableFingerprint() && !match && !restarting)
             {
-                swaylock_log(LOG_DEBUG, "Handle flag_idle_restart: %d", flag_idle_restart);
+                swaylock_log(LOG_DEBUG, "Handle flag_idle_restart: %d", flag_idle_restart.load());
 
                 if (!initialized)
                 {
@@ -1539,9 +1429,9 @@ public:
 };
 
 // Initialize static members
-int FingerprintManager::restart_count_static = 0;
-time_t FingerprintManager::last_usb_restart_time = 0;
-time_t FingerprintManager::last_usb_full_restart_time = 0;
+std::atomic<int> FingerprintManager::restart_count_static{0};
+std::atomic<time_t> FingerprintManager::last_usb_restart_time{0};
+std::atomic<time_t> FingerprintManager::last_usb_full_restart_time{0};
 
 // Define the opaque fingerprint_state struct that wraps our C++ implementation
 struct fingerprint_state
