@@ -30,6 +30,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <map>
+#include <unordered_map>
 #include <atomic>
 #include <sys/wait.h>
 #include <string>
@@ -52,73 +54,21 @@ constexpr int MAX_UNKNOWN_ERROR_COUNT = 3;
 // Event system to handle all GLib tasks in a dedicated thread
 class EventLoop
 {
+private:
+    std::atomic<bool> main_loop_running;
+
 public:
     using EventCallback = std::function<void()>;
 
-    EventLoop() : running(false) {}
+    size_t next_id = 0;
+    std::unordered_map<size_t, EventCallback> callbacks;
+
+    EventLoop() : main_loop_running(false), running(false) {}
 
     ~EventLoop()
     {
-        // Ensure we signal the thread to stop before attempting to join it
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (running)
-            {
-                running = false;
-                cv.notify_all(); // Notify all waiting threads
-                if (main_loop)
-                {
-                    g_main_loop_quit(main_loop);
-                }
-            }
-        }
-
-        // Post a final empty task to ensure the thread exits any wait state
-        try
-        {
-            post([]() {});
-        }
-        catch (...)
-        {
-            // Ignore any exceptions during shutdown
-        }
-
-        // Wait a moment before joining to let the thread exit gracefully
-        if (worker_thread.joinable())
-        {
-            try
-            {
-                worker_thread.join();
-            }
-            catch (const std::system_error &e)
-            {
-                // Handle potential system errors during thread join
-            }
-        }
-
-        // Now it's safe to clean up GLib resources
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (main_loop)
-            {
-                g_main_loop_unref(main_loop);
-                main_loop = nullptr;
-            }
-
-            if (main_context)
-            {
-                g_main_context_unref(main_context);
-                main_context = nullptr;
-            }
-
-            // Clear the queues
-            while (!event_queue.empty())
-            {
-                event_queue.pop();
-            }
-
-            delayed_tasks.clear();
-        }
+        stop();
+        callbacks.clear();
     }
 
     void start()
@@ -130,9 +80,10 @@ public:
         }
 
         running = true;
-        worker_thread = std::thread(&EventLoop::run, this);
         main_context = g_main_context_new();
         main_loop = g_main_loop_new(main_context, FALSE);
+        worker_thread = std::thread(&EventLoop::run, this);
+        worker_thread.detach();
     }
 
     void stop()
@@ -140,230 +91,183 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!running)
-            {
                 return;
-            }
 
-            running = false;
-            cv.notify_all(); // Notify all waiting threads
+            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: quitting main loop");
+            if (main_loop)
+                g_main_loop_quit(main_loop);
         }
 
-        // Post a no-op task to ensure the thread exits any wait state
-        try
-        {
-            post([]() {});
-        }
-        catch (...)
-        {
-            // Ignore any exceptions during shutdown
-        }
-
+        swaylock_log(LOG_DEBUG, "FP EventLoop::stop: joining worker thread");
         if (worker_thread.joinable())
         {
             try
             {
                 worker_thread.join();
             }
-            catch (const std::system_error &e)
+            catch (const std::exception &e)
             {
-                // Handle potential system errors during thread join
+                swaylock_log(LOG_DEBUG, "FP EventLoop::stop: worker thread join failed: %s", e.what());
+            }
+            catch (...)
+            {
+                swaylock_log(LOG_DEBUG, "FP EventLoop::stop: worker thread join failed");
             }
         }
+        if (worker_thread.joinable())
 
+            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unlocking mutex");
         std::lock_guard<std::mutex> lock(mutex);
         if (main_loop)
         {
-            g_main_loop_quit(main_loop);
+            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unrefing main loop");
             g_main_loop_unref(main_loop);
             main_loop = nullptr;
         }
 
         if (main_context)
         {
+            swaylock_log(LOG_DEBUG, "FP EventLoop::stop: unrefing main context");
             g_main_context_unref(main_context);
             main_context = nullptr;
         }
 
-        while (!event_queue.empty())
-        {
-            event_queue.pop();
-        }
+        swaylock_log(LOG_DEBUG, "FP EventLoop::stop: done");
+    }
 
-        // Clear delayed tasks
-        delayed_tasks.clear();
+    struct SelfWithId
+    {
+        EventLoop *self;
+        size_t id;
+    };
+
+    static gboolean timeoutCallback(void *data)
+    {
+        auto self_with_id = reinterpret_cast<SelfWithId *>(data);
+        auto it = self_with_id->self->callbacks.find(self_with_id->id);
+        if (it != self_with_id->self->callbacks.end())
+        {
+            auto callback = std::move(it->second);
+            self_with_id->self->callbacks.erase(it);
+            g_free(self_with_id);
+            callback();
+        }
+        else
+        {
+            g_free(self_with_id);
+        }
+        return FALSE;
     }
 
     void post(EventCallback callback)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        event_queue.push(std::move(callback));
-        cv.notify_one();
+        postDelayed(0, std::move(callback));
     }
 
     void postDelayed(int milliseconds, EventCallback callback)
     {
-        auto execute_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
-
-        std::lock_guard<std::mutex> lock(mutex);
-        delayed_tasks.emplace_back(execute_time, std::move(callback));
-        // Sort to have the earliest task first
-        std::sort(delayed_tasks.begin(), delayed_tasks.end(),
-                  [](const DelayedTask &a, const DelayedTask &b)
-                  {
-                      return a.execute_time < b.execute_time;
-                  });
-        cv.notify_one();
+        size_t id = next_id++;
+        callbacks[id] = std::move(callback);
+        SelfWithId *self_with_id = g_new0(SelfWithId, 1);
+        self_with_id->self = this;
+        self_with_id->id = id;
+        GSource *source = g_timeout_source_new(milliseconds);
+        g_source_set_callback(source, timeoutCallback, self_with_id, nullptr);
+        g_source_attach(source, main_context);
+        g_source_unref(source);
     }
 
     void postSyncImmediately(EventCallback callback)
     {
-        std::mutex sync_mutex;
+        bool run_immediately = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!running)
+            {
+                run_immediately = true;
+            }
+        }
+        auto invoke_callback = [&]()
+        {
+            // the thread might have already been stopped
+            // try to run the callback immediately
+            try
+            {
+                callback();
+            }
+            catch (const std::exception &e)
+            {
+                swaylock_log(LOG_DEBUG, "FP EventLoop::postSyncImmediately: callback failed: %s", e.what());
+            }
+            catch (...)
+            {
+                swaylock_log(LOG_DEBUG, "FP EventLoop::postSyncImmediately: callback failed");
+            }
+        };
+        if (run_immediately)
+        {
+            invoke_callback();
+            return;
+        }
         std::condition_variable sync_cv;
         bool completed = false;
 
         // Create a wrapper that will signal completion
-        auto wrapper = [callback = std::move(callback), &sync_mutex, &sync_cv, &completed]()
+        auto wrapper = [callback = std::move(callback), &sync_cv, &completed]()
         {
             // Run the original callback
             callback();
 
             // Signal completion
-            {
-                std::lock_guard<std::mutex> lock(sync_mutex);
-                completed = true;
-            }
+            completed = true;
             sync_cv.notify_one();
         };
 
         // Insert at the front of the queue
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            std::queue<EventCallback> temp;
-            temp.push(std::move(wrapper));
-            // Move all existing callbacks from event_queue to temp
-            while (!event_queue.empty())
-            {
-                temp.push(std::move(event_queue.front()));
-                event_queue.pop();
-            }
-            // Swap the queues
-            event_queue.swap(temp);
-            cv.notify_one();
+            GSource *source = g_timeout_source_new(0);
+            g_source_set_priority(source, G_PRIORITY_HIGH);
+            g_source_set_callback(source, [](void *data)
+                                  {
+                auto callback = reinterpret_cast<EventCallback *>(data);
+                (*callback)();
+                delete callback;
+                return FALSE; }, reinterpret_cast<void *>(new EventCallback(std::move(wrapper))), nullptr);
+            g_source_attach(source, main_context);
+            g_source_unref(source);
         }
 
-        // Wait for the job to complete
-        std::unique_lock<std::mutex> lock(sync_mutex);
-        sync_cv.wait(lock, [&completed]
-                     { return completed; });
-    }
-
-    void wait_for_events(bool wait_for_idle, int timeout_ms = 0)
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (timeout_ms > 0)
+        for (int i = 0; i < 50; i++)
         {
-            cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]
-                        { return (event_queue.empty() == wait_for_idle) || !running; });
+            std::mutex sync_mutex;
+            std::unique_lock<std::mutex> lock(sync_mutex);
+            // Wait for the job to complete
+            sync_cv.wait_for(lock, std::chrono::milliseconds(100), [&completed]
+                             { return completed; });
+            if (completed)
+                return;
+            if (!main_loop_running.load())
+                break;
         }
-        else
+        if (!main_loop_running.load() && !completed)
         {
-            cv.wait(lock, [&]
-                    { return (event_queue.empty() == wait_for_idle) || !running; });
+            invoke_callback();
         }
     }
 
 private:
-    // Structure to hold a delayed task
-    struct DelayedTask
-    {
-        std::chrono::steady_clock::time_point execute_time;
-        EventCallback callback;
-
-        DelayedTask(std::chrono::steady_clock::time_point time, EventCallback cb)
-            : execute_time(time), callback(std::move(cb)) {}
-    };
-
     void run()
     {
-        // Push the main context at thread startup
+        main_loop_running.store(true);
+        swaylock_log(LOG_DEBUG, "FP EventLoop running");
         g_main_context_push_thread_default(main_context);
-
-        while (running)
-        {
-            wait_for_events(false, 200);
-            if (!running)
-                break;
-            processDelayedTasks();
-            if (!running)
-                break;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                if (!event_queue.empty() && running)
-                {
-                    // No need to push/pop context here since we do it at thread level
-                    while (!event_queue.empty() && running)
-                    {
-                        auto event = std::move(event_queue.front());
-                        event_queue.pop();
-                        lock.unlock();
-
-                        // Execute the event callback
-                        if (!running)
-                            break;
-                        event();
-                        if (!running)
-                            break;
-
-                        lock.lock();
-                    }
-                }
-
-                if (!running)
-                    break;
-            }
-        }
-
-        // Pop the context at thread exit - only once
-        // this will cause GLib-CRITICAL g_main_context_pop_thread_default: assertion 'g_queue_peek_head (stack) == context' failed
-        // g_main_context_pop_thread_default(main_context);
-        // we dont need this anw
-    }
-
-    void processDelayedTasks()
-    {
-        std::vector<EventCallback> tasks_to_execute;
-
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (delayed_tasks.size() == 0)
-                return;
-            auto now = std::chrono::steady_clock::now();
-
-            // Find tasks that are due
-            auto it = delayed_tasks.begin();
-            while (it != delayed_tasks.end() && it->execute_time <= now)
-            {
-                tasks_to_execute.push_back(std::move(it->callback));
-                it = delayed_tasks.erase(it);
-            }
-        }
-
-        // Execute the tasks outside of the lock
-        if (tasks_to_execute.size() > 0)
-        {
-            // No need to push/pop context here as it's already pushed in run()
-            for (auto &task : tasks_to_execute)
-            {
-                task();
-            }
-        }
+        g_main_loop_run(main_loop);
+        swaylock_log(LOG_DEBUG, "FP EventLoop stopped");
+        main_loop_running.store(false);
     }
 
     std::thread worker_thread;
     std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<EventCallback> event_queue;
-    std::vector<DelayedTask> delayed_tasks;
     std::atomic<bool> running;
 
     GMainContext *main_context = nullptr;
@@ -1484,11 +1388,14 @@ public:
 
     ~FingerprintManager()
     {
+        swaylock_log(LOG_DEBUG, "FingerprintManager destructor");
         // Schedule cleanup before stopping the event loop
         event_loop.postSyncImmediately([this]
                                        { fingerprint_deinit(); });
+        swaylock_log(LOG_DEBUG, "FingerprintManager destructor after postSyncImmediately");
         // Stop the event loop
         event_loop.stop();
+        swaylock_log(LOG_DEBUG, "FingerprintManager destructor after stop");
     }
 
     bool verify()
@@ -1624,6 +1531,7 @@ public:
         if (!running)
         {
             // Signal the event loop to stop if not running
+            swaylock_log(LOG_DEBUG, "FingerprintManager::setIsRunning: posting stop event loop");
             event_loop.post([this]()
                             { event_loop.stop(); });
         }
