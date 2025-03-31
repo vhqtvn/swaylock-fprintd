@@ -35,6 +35,8 @@ extern "C"
 	 */
 	struct fingerprint_state *fingerprint_init(struct swaylock_state *swaylock_state);
 
+	struct swaylock_state *fingerprint_get_swaylock_state(struct fingerprint_state *fp_state);
+
 	/**
 	 * Perform fingerprint verification
 	 *

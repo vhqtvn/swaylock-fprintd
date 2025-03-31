@@ -1288,6 +1288,14 @@ static void check_fingerprint(void *d)
 
 // Handle crash signals to ensure unlock on crash
 static void handle_crash_signal(int signal) {
+	// remove crash signal handlers
+	sigaction(SIGSEGV, NULL, NULL);
+	sigaction(SIGABRT, NULL, NULL);
+	sigaction(SIGBUS, NULL, NULL);
+	sigaction(SIGFPE, NULL, NULL);
+	sigaction(SIGILL, NULL, NULL);
+	sigaction(SIGTERM, NULL, NULL);
+
     swaylock_log(LOG_ERROR, "Received signal %d; unlocking and exiting", signal);
     if (state.ext_session_lock_v1) {
         ext_session_lock_v1_unlock_and_destroy(state.ext_session_lock_v1);
