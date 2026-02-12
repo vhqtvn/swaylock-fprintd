@@ -1,4 +1,10 @@
 #!/bin/bash
+
+if [ $(id -u) -eq 0 ]; then
+    echo "Don't run as root"
+    exit 1
+fi
+
 set -e
 
 echo "=== Setting up build environment ==="

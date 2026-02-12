@@ -276,6 +276,8 @@ private:
     }
 };
 
+static std::atomic<bool> fp_device_restarting{false};
+static std::atomic<bool> fp_device_just_restarted{false};
 class FingerprintManager
 {
 private:
@@ -313,6 +315,7 @@ private:
     std::atomic<time_t> last_signal_time{0};
     std::atomic<time_t> last_start_verify_time{0};
     std::atomic<time_t> last_activity_time{0};
+    std::atomic<time_t> idle_restart_trigger_time{0};
 
     // Status buffers
     char status[128]{};
@@ -397,6 +400,12 @@ private:
 
     static void restartFingerprintUsbDevice_(bool full)
     {
+        if (fp_device_restarting)
+        {
+            return;
+        }
+        fp_device_restarting = true;
+
         if (full)
         {
             system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint full");
@@ -405,6 +414,9 @@ private:
         {
             system("sudo /usr/local/bin/vh-special-sudo restart-fingerprint");
         }
+
+        fp_device_restarting = false;
+        fp_device_just_restarted = true;
     }
 
     static void forceKill(pid_t pid)
@@ -552,13 +564,21 @@ private:
 
                     self->event_loop.post([self, mgr, data, local_error]()
                                           {
+                        int captured_init_id = data->init_id;
                         delete data;
 
-                        if (data->init_id != self->init_id) {
-                            swaylock_log(LOG_DEBUG, "Init ID changed during manager creation, discarding result");
-                            if (local_error) g_error_free(local_error);
-                            if (mgr) g_object_unref(mgr);
-                            return;
+                        if (captured_init_id != self->init_id) {
+                            swaylock_log(LOG_DEBUG, "Init ID changed during manager creation (%d -> %d)", captured_init_id, self->init_id.load());
+                            // Only discard if we already have a manager
+                            if (self->manager) {
+                                swaylock_log(LOG_DEBUG, "Already have a manager, discarding new one");
+                                if (local_error) g_error_free(local_error);
+                                if (mgr) g_object_unref(mgr);
+                                self->manager_creating = false;
+                                return;
+                            }
+                            // We don't have a manager yet, keep this one even though init_id changed
+                            swaylock_log(LOG_DEBUG, "No manager yet, keeping this one despite init_id change");
                         }
 
                         self->manager_creating = false;
@@ -742,7 +762,7 @@ private:
             }
             swaylock_log(LOG_DEBUG, "Restarting verification");
             restarting = true;
-            rebind_usb = true;
+            // rebind_usb = true;
             event_loop.postDelayed(1000, [this]()
                                    { this->restartVerifyStep1(); });
         }
@@ -954,7 +974,7 @@ private:
                 
                 int open_fail_count = ++self->restart_count;
                 if (open_fail_count >= 2 && open_fail_count <= 3) {
-                    self->restartFingerprintUsbDevice(open_fail_count == 3, true);
+                    // self->restartFingerprintUsbDevice(open_fail_count == 3, true);
                     if (!self->sleepFor(op->init_id, 3)) {
                         self->device_opening = false;
                         delete op;
@@ -1068,6 +1088,10 @@ private:
     void fingerprintInnerInit()
     {
         int current_init_id = ++init_id;
+        if (fp_device_restarting)
+        {
+            return;
+        }
         initialized = true;
         last_signal_time = time(nullptr);
         last_start_verify_time = time(nullptr);
@@ -1127,10 +1151,10 @@ private:
                 {
                     state->last_try_time = current_time;
                     ++state->try_count;
-                    if (state->try_count % 2 == 0)
-                    {
-                        restartFingerprintUsbDevice(false, true);
-                    }
+                    // if (state->try_count % 2 == 0)
+                    // {
+                    //     restartFingerprintUsbDevice(false, true);
+                    // }
                     last_signal_time = time(nullptr);
                     createManager();
                 }
@@ -1152,9 +1176,9 @@ private:
                                     data->second->last_try_time = time(nullptr);
                                     ++data->second->try_count;
                                     
-                                    if (data->second->try_count % 2 == 0) {
-                                        data->first->restartFingerprintUsbDevice(false, true);
-                                    }
+                                    // if (data->second->try_count % 2 == 0) {
+                                    //     data->first->restartFingerprintUsbDevice(false, true);
+                                    // }
                                     
                                     // Check again after a delay
                                     data->first->event_loop.postDelayed(3000, [data]() {
@@ -1210,11 +1234,11 @@ private:
         swaylock_log(LOG_DEBUG, "Restarting verification step 1");
         fingerprint_deinit();
 
-        if (rebind_usb)
-        {
-            rebind_usb = false;
-            restartFingerprintUsbDevice(false, true);
-        }
+        // if (rebind_usb)
+        // {
+        //     rebind_usb = false;
+        //     restartFingerprintUsbDevice(false, true);
+        // }
 
         // Use event_loop.postDelayed instead of g_timeout_add_seconds_full
         event_loop.postDelayed(1000, [this]()
@@ -1358,6 +1382,25 @@ public:
         // Process any pending display messages in the main thread
         processDisplayMessages();
 
+        if (fp_device_restarting)
+        {
+            return false;
+        }
+
+        if (fp_device_just_restarted)
+        {
+            fp_device_just_restarted = false;
+            restarting = false;
+            restarting = true;
+            if (!initialized)
+            {
+                swaylock_log(LOG_DEBUG, "Initializing fingerprint after device restart");
+                event_loop.post([this]
+                                { fingerprintInnerInit(); });
+            }
+            return false;
+        }
+
         // We don't need g_main_context_iteration here anymore,
         // as all GLib operations are handled in the event loop thread
 
@@ -1367,8 +1410,9 @@ public:
         }
 
         time_t current_time = time(nullptr);
-        if (flag_idle_restart)
+        if (flag_idle_restart && current_time >= idle_restart_trigger_time)
         {
+            bool forceDeviceRestart = (flag_idle_restart & 4) != 0;
             bool force = (flag_idle_restart & 2) != 0;
             flag_idle_restart = 0;
 
@@ -1376,8 +1420,18 @@ public:
             {
                 swaylock_log(LOG_DEBUG, "Handle flag_idle_restart: %d", flag_idle_restart.load());
 
+                if (forceDeviceRestart)
+                {
+                    fingerprint_deinit();
+                    swaylock_log(LOG_DEBUG, "Restarting fingerprint device due to forceDeviceRestart");
+                    displayDriverMessage("Restarting fingerprint device");
+                    restartFingerprintUsbDevice(true, false);
+                    return false;
+                }
+
                 if (!initialized)
                 {
+                    swaylock_log(LOG_DEBUG, "Initializing fingerprint due to flag_idle_restart");
                     event_loop.post([this]
                                     { fingerprintInnerInit(); });
                     return false;
@@ -1385,6 +1439,8 @@ public:
 
                 if (current_time - last_start_verify_time > 3 && force)
                 {
+                    swaylock_log(LOG_DEBUG, "Restarting verification due to force and idle");
+                    displayDriverMessage("Restarting fingerprint verification");
                     rebind_usb = false;
                     restarting = true;
                     event_loop.post([this]
@@ -1480,8 +1536,25 @@ public:
 
     void setRestartFlag(bool force)
     {
-        flag_idle_restart |= force ? 2 : 1;
-        last_activity_time = time(nullptr);
+        time_t now = time(nullptr);
+        if (force)
+        {
+            if (flag_idle_restart & 2)
+            {
+                flag_idle_restart |= 4;
+            }
+            else
+            {
+                flag_idle_restart |= 2;
+                idle_restart_trigger_time = std::max(now, last_start_verify_time + 2);
+            }
+        }
+        else
+        {
+            flag_idle_restart |= 1;
+            idle_restart_trigger_time = std::max(now, last_start_verify_time + 1);
+        }
+        last_activity_time = now;
     }
 
     void setIsRunning(bool running)
