@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "config.h"
 #include "fingerprint.h"
 #include "fingerprint-internal.h"
 extern "C"
@@ -276,8 +277,10 @@ private:
     }
 };
 
+#if HAVE_USB_DEVICE_RESTART
 static std::atomic<bool> fp_device_restarting{false};
 static std::atomic<bool> fp_device_just_restarted{false};
+#endif
 class FingerprintManager
 {
 private:
@@ -286,7 +289,9 @@ private:
     // State flags
     std::atomic<bool> is_running{true};
     std::atomic<bool> initialized{false};
+#if HAVE_USB_DEVICE_RESTART
     std::atomic<bool> rebind_usb{false};
+#endif
     std::atomic<bool> restarting{false};
     std::atomic<bool> started{false};
     std::atomic<bool> completed{false};
@@ -327,10 +332,12 @@ private:
     FprintDBusDevice *device{nullptr};
     GError *error{nullptr};
 
+#if HAVE_USB_DEVICE_RESTART
     // Static members
     static std::atomic<int> restart_count_static;
     static std::atomic<time_t> last_usb_restart_time;
     static std::atomic<time_t> last_usb_full_restart_time;
+#endif
 
     // Event loop
     EventLoop event_loop;
@@ -398,6 +405,7 @@ private:
         return check_init_id == init_id;
     }
 
+#if HAVE_USB_DEVICE_RESTART
     static void restartFingerprintUsbDevice_(bool full)
     {
         if (fp_device_restarting)
@@ -511,6 +519,7 @@ private:
             wait_thread.detach();
         }
     }
+#endif // HAVE_USB_DEVICE_RESTART
 
     void createManager()
     {
@@ -762,9 +771,14 @@ private:
             }
             swaylock_log(LOG_DEBUG, "Restarting verification");
             restarting = true;
+#if HAVE_USB_DEVICE_RESTART
             // rebind_usb = true;
             event_loop.postDelayed(1000, [this]()
                                    { this->restartVerifyStep1(); });
+#else
+            event_loop.post([this]()
+                            { this->lightRestartVerify(); });
+#endif
         }
     }
 
@@ -844,9 +858,15 @@ private:
                     timeout_data->manager->displayDriverMessage("Failed to start verification (timeout)");
                     timeout_data->manager->restarting = true;
 
+#if HAVE_USB_DEVICE_RESTART
                     timeout_data->manager->event_loop.postDelayed(1000, [timeout_data]() {
                         timeout_data->manager->restartVerifyStep1();
                     });
+#else
+                    timeout_data->manager->event_loop.post([timeout_data]() {
+                        timeout_data->manager->lightRestartVerify();
+                    });
+#endif
 
                     delete timeout_data;
                 });
@@ -1088,10 +1108,12 @@ private:
     void fingerprintInnerInit()
     {
         int current_init_id = ++init_id;
+#if HAVE_USB_DEVICE_RESTART
         if (fp_device_restarting)
         {
             return;
         }
+#endif
         initialized = true;
         last_signal_time = time(nullptr);
         last_start_verify_time = time(nullptr);
@@ -1201,6 +1223,51 @@ private:
         }
     }
 
+#if !HAVE_USB_DEVICE_RESTART
+    static void lightRestartStopCb(GObject *src, GAsyncResult *res, gpointer)
+    {
+        GError *err = nullptr;
+        fprint_dbus_device_call_verify_stop_finish(FPRINT_DBUS_DEVICE(src), res, &err);
+        if (err)
+        {
+            g_error_free(err);
+        }
+    }
+
+    void lightRestartVerify()
+    {
+        swaylock_log(LOG_DEBUG, "Light restart verification");
+        last_signal_time = time(nullptr);
+        verifying = false;
+        started = false;
+        completed = false;
+
+        if (!manager || !connection)
+        {
+            restarting = false;
+            event_loop.post([this]
+                            { fingerprintInnerInit(); });
+            return;
+        }
+
+        if (!device)
+        {
+            restarting = false;
+            event_loop.post([this]
+                            { openDeviceAsync(); });
+            return;
+        }
+
+        fprint_dbus_device_call_verify_stop(device, nullptr, lightRestartStopCb, nullptr);
+
+        event_loop.postDelayed(200, [this]
+                               {
+            restarting = false;
+            startVerify(); });
+    }
+#endif
+
+#if HAVE_USB_DEVICE_RESTART
     void restartVerifyStep2()
     {
         swaylock_log(LOG_DEBUG, "Restarting verification step 2");
@@ -1234,18 +1301,13 @@ private:
         swaylock_log(LOG_DEBUG, "Restarting verification step 1");
         fingerprint_deinit();
 
-        // if (rebind_usb)
-        // {
-        //     rebind_usb = false;
-        //     restartFingerprintUsbDevice(false, true);
-        // }
-
         // Use event_loop.postDelayed instead of g_timeout_add_seconds_full
         event_loop.postDelayed(1000, [this]()
                                {
             // Post the restart task to the event loop
             this->restartVerifyStep2(); });
     }
+#endif // HAVE_USB_DEVICE_RESTART
 
     static void handleSleepSignal(GDBusProxy *proxy,
                                   const gchar *sender_name,
@@ -1318,7 +1380,9 @@ public:
         : sw_state(swaylock_state),
           is_running(true),
           initialized(false),
+#if HAVE_USB_DEVICE_RESTART
           rebind_usb(false),
+#endif
           restarting(false),
           started(false),
           completed(false),
@@ -1382,6 +1446,7 @@ public:
         // Process any pending display messages in the main thread
         processDisplayMessages();
 
+#if HAVE_USB_DEVICE_RESTART
         if (fp_device_restarting)
         {
             return false;
@@ -1400,6 +1465,7 @@ public:
             }
             return false;
         }
+#endif
 
         // We don't need g_main_context_iteration here anymore,
         // as all GLib operations are handled in the event loop thread
@@ -1412,7 +1478,9 @@ public:
         time_t current_time = time(nullptr);
         if (flag_idle_restart && current_time >= idle_restart_trigger_time)
         {
+#if HAVE_USB_DEVICE_RESTART
             bool forceDeviceRestart = (flag_idle_restart & 4) != 0;
+#endif
             bool force = (flag_idle_restart & 2) != 0;
             flag_idle_restart = 0;
 
@@ -1420,6 +1488,7 @@ public:
             {
                 swaylock_log(LOG_DEBUG, "Handle flag_idle_restart: %d", flag_idle_restart.load());
 
+#if HAVE_USB_DEVICE_RESTART
                 if (forceDeviceRestart)
                 {
                     fingerprint_deinit();
@@ -1428,6 +1497,7 @@ public:
                     restartFingerprintUsbDevice(true, false);
                     return false;
                 }
+#endif
 
                 if (!initialized)
                 {
@@ -1441,10 +1511,15 @@ public:
                 {
                     swaylock_log(LOG_DEBUG, "Restarting verification due to force and idle");
                     displayDriverMessage("Restarting fingerprint verification");
-                    rebind_usb = false;
                     restarting = true;
+#if HAVE_USB_DEVICE_RESTART
+                    rebind_usb = false;
                     event_loop.post([this]
                                     { restartVerifyStep1(); });
+#else
+                    event_loop.post([this]
+                                    { lightRestartVerify(); });
+#endif
                     return false;
                 }
 
@@ -1460,10 +1535,15 @@ public:
                 if (current_time - last_signal_time > 60)
                 {
                     swaylock_log(LOG_DEBUG, "Restarting verification due to idle");
-                    rebind_usb = false;
                     restarting = true;
+#if HAVE_USB_DEVICE_RESTART
+                    rebind_usb = false;
                     event_loop.post([this]
                                     { restartVerifyStep1(); });
+#else
+                    event_loop.post([this]
+                                    { lightRestartVerify(); });
+#endif
                     return false;
                 }
             }
@@ -1539,11 +1619,13 @@ public:
         time_t now = time(nullptr);
         if (force)
         {
+#if HAVE_USB_DEVICE_RESTART
             if (flag_idle_restart & 2)
             {
                 flag_idle_restart |= 4;
             }
             else
+#endif
             {
                 flag_idle_restart |= 2;
                 idle_restart_trigger_time = std::max(now, last_start_verify_time + 2);
@@ -1571,10 +1653,12 @@ public:
     }
 };
 
+#if HAVE_USB_DEVICE_RESTART
 // Initialize static members
 std::atomic<int> FingerprintManager::restart_count_static{0};
 std::atomic<time_t> FingerprintManager::last_usb_restart_time{0};
 std::atomic<time_t> FingerprintManager::last_usb_full_restart_time{0};
+#endif
 
 // Define the opaque fingerprint_state struct that wraps our C++ implementation
 struct fingerprint_state

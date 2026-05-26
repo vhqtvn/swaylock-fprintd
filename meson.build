@@ -88,10 +88,41 @@ foreach xml : client_protocols
 	protos_src += wayland_scanner_client.process(xml)
 endforeach
 
+usb_restart_opt = get_option('usb-device-restart')
+have_usb_restart = false
+if usb_restart_opt.enabled()
+	have_usb_restart = true
+elif usb_restart_opt.auto()
+	detect_script = '''
+		if [ -r /sys/class/dmi/id/sys_vendor ] && [ -r /sys/class/dmi/id/product_name ]; then
+			vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)
+			product=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
+			case "$vendor" in *GPD*)
+				case "$product" in
+					*Win*|G1619*) echo yes; exit 0 ;;
+				esac
+				;;
+			esac
+		fi
+		for f in /sys/bus/usb/devices/*/product; do
+			[ -r "$f" ] || continue
+			if grep -qi fingerprint "$f" 2>/dev/null; then
+				echo yes
+				exit 0
+			fi
+		done
+		echo no
+	'''
+	detect = run_command('sh', '-c', detect_script, check: false)
+	have_usb_restart = detect.returncode() == 0 and detect.stdout().strip() == 'yes'
+endif
+summary({'USB fingerprint device restart': have_usb_restart}, section: 'Fingerprint')
+
 conf_data = configuration_data()
 conf_data.set_quoted('SYSCONFDIR', get_option('prefix') / get_option('sysconfdir'))
 conf_data.set_quoted('SWAYLOCK_VERSION', version)
 conf_data.set10('HAVE_GDK_PIXBUF', gdk_pixbuf.found())
+conf_data.set10('HAVE_USB_DEVICE_RESTART', have_usb_restart)
 
 subdir('include')
 subdir('fingerprint')

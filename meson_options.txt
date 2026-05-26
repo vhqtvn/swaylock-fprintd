@@ -4,3 +4,5 @@ option('man-pages', type: 'feature', value: 'auto', description: 'Generate and i
 option('zsh-completions', type: 'boolean', value: true, description: 'Install zsh shell completions')
 option('bash-completions', type: 'boolean', value: true, description: 'Install bash shell completions')
 option('fish-completions', type: 'boolean', value: true, description: 'Install fish shell completions')
+option('usb-device-restart', type: 'feature', value: 'auto',
+	description: 'USB-specific fingerprint device restart via vh-special-sudo. auto: enable on GPD Win Max or when a USB fingerprint reader is present.')
